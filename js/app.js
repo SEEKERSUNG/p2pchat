@@ -217,6 +217,17 @@ function b64ToBytes(b64){
   for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
   return bytes;
 }
+function utf8ToB64(str){
+  const bytes = new TextEncoder().encode(str);
+  let bin='';
+  for(let i=0;i<bytes.length;i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+function b64ToUtf8(b64){
+  const bin=atob(b64); const bytes=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
 async function encodeSignal(obj){
   const json = JSON.stringify(obj);
   if(typeof CompressionStream !== 'undefined'){
@@ -227,7 +238,7 @@ async function encodeSignal(obj){
       return 'z' + bytesToB64(buf);
     }catch(e){}
   }
-  return 'b' + btoa(unescape(encodeURIComponent(json)));
+  return 'b' + utf8ToB64(json);
 }
 async function decodeSignal(s){
   s = s.trim();
@@ -239,9 +250,9 @@ async function decodeSignal(s){
     const buf = await new Response(stream).arrayBuffer();
     json = new TextDecoder().decode(buf);
   }else if(head === 'b'){
-    json = decodeURIComponent(escape(atob(s.slice(1))));
+    json = b64ToUtf8(s.slice(1));
   }else{
-    json = decodeURIComponent(escape(atob(s))); // 兼容旧版无前缀连接码
+    json = b64ToUtf8(s); // 兼容旧版无前缀连接码
   }
   return JSON.parse(json);
 }
@@ -460,6 +471,43 @@ function connectDiagnose(pc){
     return `⚠ 连接未建立。本机真实 IP 被 mDNS 隐藏（*.local），已通过 STUN 获取反射地址。若仍失败请确认：①系统防火墙放行入站 UDP ②网络可访问 STUN 服务器 ③双方在同一局域网或均具公网 IP。${peerStr}`;
   }
   return `⚠ 连接未建立。本机已暴露真实 IP，请确认对端：①防火墙放行入站 UDP ②未因 mDNS 隐藏真实 IP ③与你在同一局域网或具公网 IP。${peerStr}`;
+}
+
+/* 清理指定联系人的所有传输 objectURL（文件/图片/视频/语音），释放 Blob 内存 */
+function revokeContactUrls(contactId){
+  const arr = store.messages[contactId] || [];
+  for(const m of arr){
+    if(m.file && m.file.fid){ const u=fileUrls.get(m.file.fid); if(u){ URL.revokeObjectURL(u); fileUrls.delete(m.file.fid); } }
+    if(m.image && m.image.iid){ const u=imageUrls.get(m.image.iid); if(u){ URL.revokeObjectURL(u); imageUrls.delete(m.image.iid); } }
+    if(m.video && m.video.vid){ const u=videoUrls.get(m.video.vid); if(u){ URL.revokeObjectURL(u); videoUrls.delete(m.video.vid); } }
+    if(m.audio && m.audio.aid){ const u=audioUrls.get(m.audio.aid); if(u){ URL.revokeObjectURL(u); audioUrls.delete(m.audio.aid); } }
+  }
+}
+/* 清理所有传输 objectURL（退出时调用） */
+function revokeAllUrls(){
+  for(const u of fileUrls.values()) URL.revokeObjectURL(u);
+  for(const u of imageUrls.values()) URL.revokeObjectURL(u);
+  for(const u of videoUrls.values()) URL.revokeObjectURL(u);
+  for(const u of audioUrls.values()) URL.revokeObjectURL(u);
+  fileUrls.clear(); imageUrls.clear(); videoUrls.clear(); audioUrls.clear();
+}
+/* 清理指定联系人的 Audio 播放器，释放内存 */
+function stopContactAudioPlayers(contactId){
+  const arr = store.messages[contactId] || [];
+  for(const m of arr){
+    if(m.audio && m.audio.aid){
+      const au = audioPlayers.get(m.audio.aid);
+      if(au){ try{ au.pause(); au.src=''; au.load(); }catch(e){} }
+      audioPlayers.delete(m.audio.aid);
+    }
+  }
+}
+/* 清理所有 Audio 播放器（退出时调用） */
+function stopAllAudioPlayers(){
+  for(const au of audioPlayers.values()){
+    try{ au.pause(); au.src=''; au.load(); }catch(e){}
+  }
+  audioPlayers.clear();
 }
 
 /* 连接建立看门狗：真正开始 ICE 连通后（邀请方提交应答码 / 被邀方生成应答码）若 90s 内未建立连接，给出诊断提示。
@@ -1286,7 +1334,7 @@ async function sendFile(file){
       const buf=await file.slice(offset, offset+FILE_CHUNK).arrayBuffer();
       // 背压：缓冲过高时等 bufferedamountlow 事件（带超时 + 通道关闭检测）
       if(channel.bufferedAmount > FILE_BUF_HIGH){
-        try{ await backpressureWait(channel, 30000); }catch(e){ break; }
+        try{ await backpressureWait(channel, 30000); }catch(e){ toast("传输中断：网络拥塞超时"); break; }
       }
       if(channel.readyState!=='open') break;
       channel.send(buf);
@@ -1375,7 +1423,7 @@ async function sendImage(file){
     while(offset<file.size && channel.readyState==='open'){
       const buf=await file.slice(offset, offset+FILE_CHUNK).arrayBuffer();
       if(channel.bufferedAmount > FILE_BUF_HIGH){
-        try{ await backpressureWait(channel, 30000); }catch(e){ break; }
+        try{ await backpressureWait(channel, 30000); }catch(e){ toast("传输中断：网络拥塞超时"); break; }
       }
       if(channel.readyState!=='open') break;
       channel.send(buf);
@@ -1474,7 +1522,7 @@ async function sendVideo(file){
     while(offset<file.size && channel.readyState==='open'){
       const buf=await file.slice(offset, offset+FILE_CHUNK).arrayBuffer();
       if(channel.bufferedAmount > FILE_BUF_HIGH){
-        try{ await backpressureWait(channel, 30000); }catch(e){ break; }
+        try{ await backpressureWait(channel, 30000); }catch(e){ toast("传输中断：网络拥塞超时"); break; }
       }
       if(channel.readyState!=='open') break;
       channel.send(buf);
@@ -1573,7 +1621,7 @@ async function sendAudio(blob){
     while(offset<blob.size && channel.readyState==='open'){
       const buf=await blob.slice(offset, offset+FILE_CHUNK).arrayBuffer();
       if(channel.bufferedAmount > FILE_BUF_HIGH){
-        try{ await backpressureWait(channel, 30000); }catch(e){ break; }
+        try{ await backpressureWait(channel, 30000); }catch(e){ toast("传输中断：网络拥塞超时"); break; }
       }
       if(channel.readyState!=='open') break;
       channel.send(buf);
@@ -1962,6 +2010,8 @@ function deleteContact(){
   const rv = revivable.get(currentId);
   if(rv){ try{ rv.close(); }catch(e){} }
   revivable.delete(currentId); cancelAutoRevive(currentId); autoReviveRetries.delete(currentId); peerBye.delete(currentId);
+  stopContactAudioPlayers(currentId); // 释放语音播放器内存
+  revokeContactUrls(currentId);       // 释放文件/图片/视频/语音 objectURL 内存
   store.contacts=store.contacts.filter(c=>c.id!==currentId);
   delete store.messages[currentId];
   currentId=null; saveStore(); renderAll(); closeDialog('dlgDetail'); toast("已删除");
@@ -1969,6 +2019,8 @@ function deleteContact(){
 function clearHistory(){
   if(!currentId) return;
   if(!confirm("清空与该联系人的聊天记录？")) return;
+  stopContactAudioPlayers(currentId); // 释放语音播放器内存
+  revokeContactUrls(currentId);       // 释放文件/图片/视频/语音 objectURL 内存
   store.messages[currentId]=[]; saveStore(); renderMessages(); closeDialog('dlgDetail'); toast("已清空");
 }
 
@@ -2017,6 +2069,7 @@ async function doLogout(backup){
   if(recStream){ try{ recStream.getTracks().forEach(t=>t.stop()); }catch(e){} recStream=null; }
   connections.clear(); channelMap.clear(); revivable.clear(); peerBye.clear();
   autoReviveTimers.forEach(t=>clearTimeout(t)); autoReviveTimers.clear(); autoReviveRetries.clear();
+  stopAllAudioPlayers(); revokeAllUrls(); // 释放所有语音播放器与传输 objectURL 内存
   currentId=null; clearConnectWatchdog();
   store=defaultStore(); // 内存占位，不保存 → 保持 localStorage 为空，下次启动仍引导
   renderAll();

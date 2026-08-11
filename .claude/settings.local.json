@@ -3,7 +3,11 @@
     "allow": [
       "WebSearch",
       "PowerShell(Resolve-DnsName *)",
-      "PowerShell($code = Get-Content D:\\\\code\\\\p2pChat\\\\index.html -Raw -Encoding UTF8; try { New-Object System.Func[object]\\($code\\) } catch { $_.Exception.Message })"
+      "PowerShell($code = Get-Content D:\\\\code\\\\p2pChat\\\\index.html -Raw -Encoding UTF8; try { New-Object System.Func[object]\\($code\\) } catch { $_.Exception.Message })",
+      "PowerShell(node -e \"new Function\\(require\\('fs'\\).readFileSync\\('D:/code/p2pChat/js/app.js','utf8'\\)\\); console.log\\('syntax OK'\\)\")",
+      "Bash(git add *)",
+      "Bash(git reset *)",
+      "Bash(git commit *)"
     ]
   }
 }
