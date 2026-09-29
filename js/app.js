@@ -17,8 +17,6 @@ const DEFAULT_STUN_SERVERS = [
 let store = loadStore();
 let currentId = null;          // 当前选中联系人 id
 let pendingPC = null;          // 握手中的 PeerConnection
-let pendingRole = null;        // 'offer' | 'answer'
-let pendingChannel = null;
 let pendingPeerIps = null;     // 解析对端连接码时暂存其真实 IP（供 finalizeChannel 写入 contact.peerIps）
 let connections = new Map();   // contactId -> {chat, file, pc, outSeq, inSeq, pending} (双通道连接)
 let channelMap = new Map();    // channel -> {pc, contactId|null, isChat}
@@ -45,7 +43,12 @@ function loadStore(){
   try{
     const raw = localStorage.getItem(STORE_KEY);
     if(!raw) return defaultStore();
-    const d = JSON.parse(raw);
+    return migrateStore(JSON.parse(raw));
+  }catch(e){ console.warn("load fail",e); return defaultStore(); }
+}
+/* 数据迁移：顶层字段补齐 + contact 字段迁移 + 版本归一。
+   loadStore（启动加载）与 importJSON（导入备份）共用，保证两条入口行为一致（doc §6）。 */
+function migrateStore(d){
     if(!d.identity) d.identity = defaultStore().identity;
     if(!d.contacts) d.contacts = [];
     if(!d.messages) d.messages = {};
@@ -61,9 +64,22 @@ function loadStore(){
     });
     d.version = 4; // v4 起仅直连，忽略历史 STUN 配置
     return d;
-  }catch(e){ console.warn("load fail",e); return defaultStore(); }
 }
 function saveStore(){ try{ localStorage.setItem(STORE_KEY, JSON.stringify(store)); }catch(e){ console.warn("save fail",e); } }
+let _saveTimer=null;
+/* v2.13.6 防抖落盘：合并高频写入——接收消息/ACK/回执原本每次都全量 JSON.stringify 整个 store，
+   长聊天记录下每条消息都是 O(总量) 开销。仅用于高频路径（addMessage/回执/媒体消息）；
+   低频与破坏性操作（删除/导入/退出/引导/设置）仍走 saveStore 立即写。
+   beforeunload / visibilitychange(hidden) / doLogout 调 flushSave() 清 pending 并立即写，
+   防抖期间页面被回收不丢最近 100ms 的消息。 */
+function saveStoreDebounced(){
+  if(_saveTimer) return;
+  _saveTimer=setTimeout(()=>{ _saveTimer=null; saveStore(); }, 100);
+}
+function flushSave(){
+  if(_saveTimer){ clearTimeout(_saveTimer); _saveTimer=null; }
+  saveStore();
+}
 
 function randId(){ return "p"+Math.random().toString(36).slice(2,10)+Date.now().toString(36).slice(-4); }
 function nowTs(){ return Date.now(); }
@@ -93,10 +109,12 @@ function ensureContact(peerId, name){
   return c;
 }
 function isMobile(){ return window.matchMedia && window.matchMedia('(max-width:680px)').matches; }
+/* iOS 检测（含 iPadOS：桌面版 UA + 触屏），v2.13.6 抽取共用（录像 capture 移除 / 录音禁用） */
+function isIOS(){ return /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform==='MacIntel' && navigator.maxTouchPoints>1); }
 function selectContact(id, skipLastRead){
   currentId=id;
   if(store.unread[id]){ store.unread[id]=0; saveStore(); }
-  updateMobileView(); renderContacts(); renderChat();
+  updateMobileView(); renderContacts(); renderChat(true); // v2.13.6：进入聊天强制滚到底
   // 仅在已连接时记录 lastReadTs（用户真正在"看新消息"）;
   // 未连接时保留旧值，避免断线后重新点入时刷新为 nowTs，
   // 导致重连后对方离线消息（ts < nowTs）无法触发分界线
@@ -199,8 +217,15 @@ function waitIceComplete(pc){
     const finish=()=>{ if(!done){ done=true; pc.removeEventListener('icegatheringstatechange',check); res(); } };
     const check=()=>{ if(pc.iceGatheringState==='complete') finish(); };
     pc.addEventListener('icegatheringstatechange',check);
-    // 兜底：gathering 通常很快完成，5s 后用已收集的候选继续，防止异常卡死
-    setTimeout(finish, 5000);
+    // 兜底：gathering 通常很快完成，5s 后用已收集的候选继续，防止异常卡死。
+    // v2.13.6：5s 到点若一个 srflx 都没收到（STUN 往返被高延迟网络拖慢，或某台 STUN 不可达拖住 gathering），
+    // 再宽限 5s——直接截断会生成缺反射地址的连接码，公网直连场景必失败；宽限后无论有无 srflx 都继续。
+    setTimeout(()=>{
+      if(done) return;
+      const hasSrflx = / typ srflx/.test((pc.localDescription && pc.localDescription.sdp) || '');
+      if(hasSrflx) finish();
+      else setTimeout(finish, 5000);
+    }, 5000);
   });
 }
 
@@ -510,8 +535,9 @@ function stopAllAudioPlayers(){
   audioPlayers.clear();
 }
 
-/* 连接建立看门狗：真正开始 ICE 连通后（邀请方提交应答码 / 被邀方生成应答码）若 90s 内未建立连接，给出诊断提示。
-   注意：邀请方生成邀请码阶段不启动看门狗——此时仍在等对方人工回发应答码，交换时间不可控，不应计入连通超时。
+/* 连接建立看门狗：真正开始 ICE 连通后（邀请方 finalizeOffer 提交应答码）若 90s 内未建立连接，给出诊断提示。
+   注意：双方各自「生成连接码」的阶段均不启动看门狗——此时仍在等对方人工回发码，交换时间不可控，不应计入连通超时。
+   （被邀方生成应答码后同样在等邀请方人工粘贴，v2.13.5 起同样不启动；硬失败由 ICE failed 事件即时报错。）
    90s 容错覆盖双方交换连接码/二维码（扫码、复制粘贴）+ 跨网络 IPv6 ICE 连通；ICE failed 事件会立即报错，看门狗仅在卡住时兜底。 */
 let connectWatchdog=null;
 function startConnectWatchdog(pc, label){
@@ -589,14 +615,12 @@ function attemptRevive(contactId){
 
 /* 邀请方：生成邀请码 */
 async function startInvite(){
-  pendingRole='offer';
   showConnectDialog([{step:"第 1 步 · 正在生成邀请码", body:`
     <div class="gen-loading"><span class="spinner"></span>正在创建加密连接、收集 STUN 反射地址…</div>`}]);
   cleanupPending();
   const pc = newPC(); pendingPC = pc;
   const chatCh = pc.createDataChannel("chat",{ordered:true});
   const fileCh = pc.createDataChannel("file",{ordered:true});
-  pendingChannel = chatCh;
   bindChannel(chatCh, pc, null, null, true);
   bindChannel(fileCh, pc, null, null, false);
   const offer = await pc.createOffer();
@@ -638,7 +662,6 @@ async function finalizeOffer(){
 
 /* 被邀方：粘贴邀请码，生成应答码 */
 async function startAccept(){
-  pendingRole='answer';
   cleanupPending();
   showConnectDialog([
     {step:"第 2 步 · 你是被邀方", body:`
@@ -656,6 +679,10 @@ async function acceptOffer(){
   try{
     const obj = await decodeSignal(s);
     if(obj.type!=='offer') return toast("这不是邀请码");
+    // v2.13.5：先清理上一次 acceptOffer 残留的 PC（重复点击 / 上次 SDP 无效留下的废 PC），防止泄漏。
+    // 必须置于 pendingPeerIps 赋值之前——cleanupPending 会清空 pendingPeerIps。
+    // 在途的那次生成会经 pendingPC !== pc 检查安全中止（与 startInvite 同模式）。
+    cleanupPending();
     pendingPeerIps = Array.isArray(obj.ips) ? obj.ips : null; // 暂存对端真实 IP
     // 立即显示生成中提示，避免用户以为点击无反应（STUN 收集候选需要网络往返）
     const co=document.getElementById('codeOut');
@@ -664,7 +691,6 @@ async function acceptOffer(){
     const pc = newPC(); pendingPC = pc;
     pc.ondatachannel = e=>{
       if(e.channel.label==='chat'){
-        pendingChannel = e.channel;
         bindChannel(e.channel, pc, obj.identity.id, obj.identity.name, true);
       } else if(e.channel.label==='file'){
         bindChannel(e.channel, pc, null, null, false);
@@ -675,7 +701,10 @@ async function acceptOffer(){
     await pc.setLocalDescription(ans);
     await waitIceComplete(pc);
     if(pendingPC !== pc) return; // 用户在等待期间点了取消，中止生成
-    startConnectWatchdog(pc, "连接");
+    // v2.13.5：不启动连接看门狗——与邀请方对称。应答码仍需人工回传给邀请方（扫码/复制粘贴），
+    // 交换时间不可控，不应计入连通超时（旧版把它计入，邀请方超 90s 才粘贴时被邀方 PC 被销毁，
+    // 之后 ICE 必然无法建立）。硬失败由 ICE failed 事件即时报错（bindChannel 已监听），
+    // 无人来连则 PC 留待用户取消时清理（cleanupPending），与 v2.7.9 对邀请方的取舍一致。
     if(!hasRealHostCandidate(pc)) toast("ℹ 本机真实 IP 被 mDNS 隐藏，已通过 STUN 辅助获取反射地址", 5000);
     const code = await encodeSignal({type:"answer", sdp: pc.localDescription, identity: store.identity, ips: extractIpsFromPc(pc)});
     document.getElementById('codeOut').value = code;
@@ -734,9 +763,9 @@ function onChannelOpen(channel, peerId, peerName, isChat){
   }
 }
 function onChannelMsg(channel, data){
-  // 二进制：文件/图片分块（仅 file 通道收发）
-  // meta/end 走 chat 通道避免队头阻塞，incoming 状态挂在 chat 条目上；
-  // 二进制分块到达 file 通道时需回溯同 PC 的 chat 条目查找 incoming 状态
+  // 二进制：文件/图片/视频/语音分块（仅 file 通道收发）。
+  // v2.10.2 起 meta/分块/end 全走同一 file 通道（同一 SCTP ordered stream），incoming 状态挂在本通道条目上；
+  // 为兼容旧版对端（meta 仍走 chat 通道），本条目无 incoming 状态时回溯同 PC 的 chat 条目查找
   if(typeof data !== 'string'){
     let target = channelMap.get(channel);
     if(target && !target.incomingFile && !target.incomingImage && !target.incomingVideo && !target.incomingAudio){
@@ -808,7 +837,7 @@ function onChannelMsg(channel, data){
     if(c){
       if(typeof m.seq==='number') c.peerReadSeq = Math.max(c.peerReadSeq||0, m.seq);
       c.peerReadTs = m.ts; // 保留时间戳用于文件/图片消息回退
-      saveStore(); if(cId===currentId) requestAnimationFrame(()=>refreshMessageReadStatus(cId));
+      saveStoreDebounced(); if(cId===currentId) requestAnimationFrame(()=>refreshMessageReadStatus(cId));
     }
   }
   else if(m.type==='ack'){
@@ -822,13 +851,13 @@ function onChannelMsg(channel, data){
     if(c){
       c.peerDeliveredSeq = Math.max(c.peerDeliveredSeq||0, m.seq);
       c.peerDeliveredTs = nowTs(); // 保留时间戳用于文件/图片消息回退
-      saveStore(); if(cId===currentId) requestAnimationFrame(()=>refreshMessageReadStatus(cId));
+      saveStoreDebounced(); if(cId===currentId) requestAnimationFrame(()=>refreshMessageReadStatus(cId));
     }
   }
   else if(m.type==='delivered'){
     const c = getContact(cId);
     if(c && (!c.peerDeliveredTs || m.ts > c.peerDeliveredTs)){
-      c.peerDeliveredTs = m.ts; saveStore(); if(cId===currentId) requestAnimationFrame(()=>refreshMessageReadStatus(cId));
+      c.peerDeliveredTs = m.ts; saveStoreDebounced(); if(cId===currentId) requestAnimationFrame(()=>refreshMessageReadStatus(cId));
     }
   }
   else if(m.type==='bye'){ appendSys(cId,"对方已断开"); peerBye.add(cId); }
@@ -838,7 +867,8 @@ function onChannelMsg(channel, data){
   }
   else if(m.type==='pong'){ /* 心跳回应：连接存活，无需处理 */ }
   // 收到消息发已送达回执（msg 已通过 ACK 覆盖，此处仅对无 seq 消息和 file-meta 等发 delivered）
-  if(m.type!=='delivered' && m.type!=='read' && m.type!=='ack' && m.type!=='ping' && m.type!=='pong'){
+  // v2.13.6：排除 bye——对端主动断开通知无需回执（旧版会对 bye 多回一条 delivered）
+  if(m.type!=='delivered' && m.type!=='read' && m.type!=='ack' && m.type!=='ping' && m.type!=='pong' && m.type!=='bye'){
     // 仅非 msg 或旧版无 seq 的 msg 发 delivered（新版 msg 走 ACK）
     if(m.type!=='msg' || typeof m.seq!=='number') sendDeliveredReceipt(cId);
   }
@@ -889,11 +919,18 @@ function finalizeChannels(chatCh, peerId, peerName){
       else if(mm.dir === 'in') maxInSeq = Math.max(maxInSeq, mm.seq);
     }
   }
+  // v2.13.5：清空聊天记录后历史为空，但联系人的 peerReadSeq/peerDeliveredSeq 仍持久化保留；
+  // outSeq 若归零，新发出 seq 0 <= 旧 peerReadSeq 会被误标「已读」。以持久化回执序号为下界兜底
+  // （peerReadSeq 即对端已读过的本方消息上界，新 seq 必须大于它）。
+  maxOutSeq = Math.max(maxOutSeq, c.peerReadSeq||-1, c.peerDeliveredSeq||-1);
+  // v2.13.5：同 id 旧连接残留（半开：chat 已断 file 未断时会被本次覆盖）——先停心跳/清重传定时器，
+  // 防旧 hbTimer interval 泄漏累积（每次半断重连叠一个，且旧 interval 会 ping 到新连接上造成双发）
+  const prevConn = connections.get(peerId);
+  if(prevConn){ stopHeartbeat(prevConn); for(const [s2,p2] of prevConn.pending) clearTimeout(p2.timer); prevConn.pending.clear(); }
   connections.set(peerId, {chat: chatCh, file: fileCh, pc, outSeq: maxOutSeq+1, inSeq: maxInSeq+1, pending:new Map()});
   revivable.delete(peerId); peerBye.delete(peerId); cancelAutoRevive(peerId);
   autoReviveRetries.delete(peerId); // 连接成功，清零自动恢复重试计数
   if(pendingPC===pc) pendingPC=null;
-  pendingChannel=null;
   clearConnectWatchdog();
   c.lastSeen = nowTs();
   if(pendingPeerIps && pendingPeerIps.length){ c.peerIps = pendingPeerIps; }
@@ -908,7 +945,8 @@ function finalizeChannels(chatCh, peerId, peerName){
   const hadLastRead = !!c.lastReadTs;
   selectContact(peerId, hadLastRead);
   if(!hadLastRead) c.lastReadTs = nowTs();
-  if(!oldId) appendSys(peerId, "✅ 已建立加密直连");
+  // v2.13.5：无条件提示——旧版仅邀请方显示（被邀方 bindChannel 时已带 contactId，oldId 恒真被跳过），双方不对称
+  appendSys(peerId, "✅ 已建立加密直连");
   toast("已连接 "+contactDisplayText(c));
   startHeartbeat(peerId); // 启动心跳保活
   // 自动发送离线期间排队的消息
@@ -927,7 +965,11 @@ function onChannelClose(channel){
   const conn = connections.get(cId);
   if(!conn) return;
   // 断开当前通道
-  if(info.isChat && conn.chat===channel) conn.chat = null;
+  if(info.isChat && conn.chat===channel){
+    conn.chat = null;
+    // v2.13.5：心跳跑在 chat 通道上，chat 断即停——防半开连接（file 未断）下 interval 空转泄漏
+    stopHeartbeat(conn);
+  }
   else if(!info.isChat && conn.file===channel) conn.file = null;
   // 两个通道都断开才算真正断开
   if(!conn.chat && !conn.file){
@@ -938,7 +980,7 @@ function onChannelClose(channel){
     connections.delete(cId);
     // 保留底层 PC 以便尝试免交换码恢复
     if(pc && pc.iceConnectionState!=='closed'){ revivable.set(cId, pc); }
-    if(cId===currentId){ appendSys(cId,"连接已断开"); renderChat(); }
+    if(cId===currentId){ appendSys(cId,"连接已断开"); renderTopbar(); } // v2.13.6: 消息由 appendSys 渲染，这里只需刷新顶栏未连接状态（旧版 renderChat 双重渲染）
     renderContacts();
     if(revivable.has(cId) && !peerBye.has(cId) && !autoReviveTimers.has(cId)){
       scheduleAutoRevive(cId);
@@ -995,7 +1037,6 @@ function cleanupPending(){
     try{ pendingPC.close(); }catch(e){}
     pendingPC=null;
   }
-  pendingChannel=null;
   pendingPeerIps=null;
 }
 async function detectPeerIp(pc, contactId){
@@ -1119,7 +1160,7 @@ function addPendingMessage(contactId, dir, text, ts){
   if(!store.messages[contactId]) store.messages[contactId]=[];
   store.messages[contactId].push({ts, dir, text, pending:true});
   saveStore();
-  if(contactId===currentId) renderMessages();
+  if(contactId===currentId) renderMessages(true); // v2.13.6：自己发的离线消息强制滚到底
   renderContacts();
 }
 /* 连接建立后，自动发送所有离线期间排队的消息 */
@@ -1141,7 +1182,7 @@ function flushPendingMessages(contactId){
   }
   if(flushed){
     saveStore();
-    if(contactId===currentId) renderMessages();
+    if(contactId===currentId) renderMessages(true); // v2.13.6：批量补发后强制滚到底
     appendSys(contactId, "↻ 已自动发送离线消息");
   }
 }
@@ -1152,8 +1193,8 @@ function addMessage(contactId, dir, text, ts, seq){
   store.messages[contactId].push(item);
   const c=getContact(contactId); if(c) c.lastSeen=ts||nowTs();
   if(dir==='in' && contactId!==currentId){ store.unread[contactId]=(store.unread[contactId]||0)+1; }
-  saveStore();
-  if(contactId===currentId) renderMessages();
+  saveStoreDebounced();
+  if(contactId===currentId) renderMessages(dir==='out'); // v2.13.6：自己发的消息强制滚到底，收到的按 nearBottom
   renderContacts();
 }
 function appendSys(contactId, text){
@@ -1367,8 +1408,8 @@ function addFileMessage(contactId, dir, meta){
   store.messages[contactId].push(item);
   const c=getContact(contactId); if(c) c.lastSeen=item.ts;
   if(dir==='in' && contactId!==currentId){ store.unread[contactId]=(store.unread[contactId]||0)+1; }
-  saveStore();
-  if(contactId===currentId) renderMessages();
+  saveStoreDebounced();
+  if(contactId===currentId) renderMessages(dir==='out');
   renderContacts();
 }
 function renderFileCardInto(el, f){
@@ -1456,8 +1497,8 @@ function addImageMessage(contactId, dir, meta){
   store.messages[contactId].push(item);
   const c=getContact(contactId); if(c) c.lastSeen=item.ts;
   if(dir==='in' && contactId!==currentId){ store.unread[contactId]=(store.unread[contactId]||0)+1; }
-  saveStore();
-  if(contactId===currentId) renderMessages();
+  saveStoreDebounced();
+  if(contactId===currentId) renderMessages(dir==='out');
   renderContacts();
 }
 function renderImageInto(el, img){
@@ -1495,8 +1536,7 @@ function pickVideoCamera(){ document.getElementById('videoCameraInput').click();
 // （相机占内存 + 已有 WebRTC 连接占内存）。改走系统选择器（用户仍可选"录像"），Safari 不立即
 // 后台，降低闪退概率；安卓保留 capture 直接调起后置相机。
 (function(){
-  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform==='MacIntel' && navigator.maxTouchPoints>1);
-  if(isIOS){
+  if(isIOS()){
     const vci=document.getElementById('videoCameraInput');
     if(vci) vci.removeAttribute('capture');
   }
@@ -1555,8 +1595,8 @@ function addVideoMessage(contactId, dir, meta){
   store.messages[contactId].push(item);
   const c=getContact(contactId); if(c) c.lastSeen=item.ts;
   if(dir==='in' && contactId!==currentId){ store.unread[contactId]=(store.unread[contactId]||0)+1; }
-  saveStore();
-  if(contactId===currentId) renderMessages();
+  saveStoreDebounced();
+  if(contactId===currentId) renderMessages(dir==='out');
   renderContacts();
 }
 function renderVideoInto(el, v){
@@ -1654,8 +1694,8 @@ function addAudioMessage(contactId, dir, meta){
   store.messages[contactId].push(item);
   const c=getContact(contactId); if(c) c.lastSeen=item.ts;
   if(dir==='in' && contactId!==currentId){ store.unread[contactId]=(store.unread[contactId]||0)+1; }
-  saveStore();
-  if(contactId===currentId) renderMessages();
+  saveStoreDebounced();
+  if(contactId===currentId) renderMessages(dir==='out');
   renderContacts();
 }
 function renderAudioInto(el, a){
@@ -1671,7 +1711,8 @@ function renderAudioInto(el, a){
     </div>`;
   }else if(transferring){
     const pct = st && st.size ? Math.min(100, Math.round(st.received/st.size*100)) : 0;
-    body=`<div class="aud-msg"><span class="spinner" style="margin-right:6px"></span>接收中 ${pct}%</div>`;
+    // v2.13.5：与图片/视频同构（.img-expired>div），updateAudioProgress 才能按同一选择器更新进度
+    body=`<div class="img-expired"><div style="text-align:center"><span class="spinner" style="margin-right:6px"></span>接收中 ${pct}%</div></div>`;
   }else{
     body=`<div class="aud-msg aud-expired">语音已失效</div>`;
   }
@@ -1730,8 +1771,7 @@ function startRecord(){
   if(!currentId) return toast("请先选择联系人");
   if(!connections.has(currentId)) return toast("未连接，无法发送语音");
   // iOS Safari 的 MediaRecorder 录音会触发进程级崩溃（无法 try/catch 兜底），禁用并提示
-  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform==='MacIntel' && navigator.maxTouchPoints>1);
-  if(isIOS) return toast("iOS 录音易致浏览器崩溃，请改用 Edge/Chrome 或电脑端录音");
+  if(isIOS()) return toast("iOS 录音易致浏览器崩溃，请改用 Edge/Chrome 或电脑端录音");
   if(typeof MediaRecorder === 'undefined') return toast("当前浏览器不支持录音");
   if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return toast("麦克风不可用（需 HTTPS 或 localhost）");
   recPressing=true;
@@ -1742,6 +1782,7 @@ function startRecord(){
   if(ind) ind.style.display='flex';
   if(rt) rt.textContent='准备中…';
   if(recStream && recStream.active){ beginRec(recStream); return; } // 复用已授权的麦克风，免重复申请
+  if(recPending) return; // v2.13.5：权限申请中重复按住——不再发第二个 getUserMedia（会双 MediaRecorder 混流），首个结果就绪后按 recPressing 自动开始
   recPending=true;
   recMime = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : (MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4' : '');
   navigator.mediaDevices.getUserMedia({audio:true}).then(stream=>{
@@ -1860,7 +1901,7 @@ function renderContacts(){
     list.appendChild(div);
   }
 }
-function renderChat(){ renderTopbar(); renderMessages(); }
+function renderChat(scrollBottom){ renderTopbar(); renderMessages(scrollBottom); } // v2.13.6：scrollBottom 透传（切换联系人时强制滚底）
 function renderTopbar(){
   const btn=document.getElementById('btnDetail');
   const rc=document.getElementById('btnReconnect');
@@ -1879,11 +1920,14 @@ function renderTopbar(){
   rc.style.display= connected? 'none':'inline-block'; // 仅未连接时显示重连按钮
   if(!connected && !hasMessages(currentId)) document.getElementById('messages').innerHTML=notConnHtml();
 }
-function renderMessages(){
+function renderMessages(forceScroll){
   const box=document.getElementById('messages');
   if(!currentId){ box.innerHTML=emptyHtml(); return; }
   if(!connections.has(currentId) && !hasMessages(currentId)){ box.innerHTML=notConnHtml(); return; }
   const arr=store.messages[currentId]||[];
+  // v2.13.6：记录渲染前是否接近底部——仅此时（或 forceScroll，如自己发消息/切换联系人）才自动滚到底，
+  // 正在上翻查看历史时对方新消息/系统消息到达不拽走视图
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
   box.innerHTML='';
   const c = getContact(currentId);
   const lastRead = c && c.lastReadTs;
@@ -1930,7 +1974,7 @@ function renderMessages(){
     }
     box.appendChild(el);
   }
-  box.scrollTop=box.scrollHeight;
+  if(forceScroll || nearBottom) box.scrollTop=box.scrollHeight; // v2.13.6：仅近底部或强制时跟随
   // 刷新已读回执标记
   if(currentId) refreshMessageReadStatus(currentId);
 }
@@ -2062,6 +2106,7 @@ function logoutAccount(){
 async function doLogout(backup){
   closeDialog('dlgLogout');
   if(backup) await exportJSON(); // 退出前导出一份备份（await 确保导出完成再清数据）
+  flushSave(); // v2.13.6：清掉防抖 pending 再删 key，防 100ms 后把 defaultStore 写回 localStorage
   localStorage.removeItem(STORE_KEY);
   channelMap.forEach(i=>{try{i.pc.close();}catch(e){}});
   connections.forEach(conn=>{ for(const [seq,p] of conn.pending) clearTimeout(p.timer); conn.pending.clear(); stopHeartbeat(conn); });
@@ -2109,13 +2154,17 @@ document.getElementById('fileInput').addEventListener('change', e=>{
         const d=JSON.parse(r.result);
         if(!d.identity || !Array.isArray(d.contacts)) throw new Error("格式不符");
         if(!confirm("导入将覆盖当前数据，是否继续？")){ onboarding=false; return; }
-        store={...defaultStore(), ...d};
-        if(!store.messages) store.messages={};
-        if(!store.settings) store.settings={};
-        if(!store.unread) store.unread={};
-        store.version=4; // 仅直连，忽略历史 STUN 配置
+        // v2.13.5：导入即切换整套账号数据，旧连接必须全套清理（对齐 doLogout）——
+        // 否则旧 DataChannel 仍开着，来消息会往新 store 按旧 contactId 写孤儿消息；
+        // 残留的 revivable/autoRevive 定时器还会在导入后复活已不存在的联系人。
+        channelMap.forEach(i=>{try{i.pc.close();}catch(e){}});
         connections.forEach(conn=>{ for(const [seq,p] of conn.pending) clearTimeout(p.timer); conn.pending.clear(); stopHeartbeat(conn); });
-        saveStore(); connections.clear(); currentId=null; renderAll(); toast("导入成功");
+        autoReviveTimers.forEach(t=>clearTimeout(t)); autoReviveTimers.clear(); autoReviveRetries.clear();
+        connections.clear(); channelMap.clear(); revivable.clear(); peerBye.clear();
+        cleanupPending();
+        // v2.13.5：走 migrateStore 做 contact 字段迁移（旧备份补 nameSet/peerName/seq 回执字段），与 loadStore 一致
+        store = migrateStore({...defaultStore(), ...d});
+        saveStore(); currentId=null; renderAll(); toast("导入成功");
         if(onboarding){ onboarding=false; closeDialog('dlgOnboard'); }
       }catch(err){ toast("导入失败: "+err.message); }
     };
@@ -2168,6 +2217,7 @@ window.addEventListener('popstate', ()=>{
    恢复前台后底层网络通常未变——立即对每个已连接联系人补发 ping 激活 ICE、探测存活；
    对断开待恢复（revivable）的连接立即触发 autoRevive（墓碑恢复后 ICE 可能仍存活，可免交换码恢复）。 */
 document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState === 'hidden'){ flushSave(); return; } // v2.13.6: 切后台/锁屏前落盘防抖中的写入（移动端可能被系统直接回收，beforeunload 不保证触发）
   if(document.visibilityState !== 'visible') return;
   for(const cId of connections.keys()) sendPing(cId);
   for(const cId of revivable.keys()){
@@ -2184,6 +2234,7 @@ function confirmExit(yes){
   else { try{ history.pushState({p2pchat:'root'},''); }catch(e){} } // 取消：重新拦截下次返回
 }
 window.addEventListener('beforeunload', ()=>{
+  flushSave(); // v2.13.6: 页面卸载前落盘防抖 pending（setTimeout 在 unload 中不执行）
   channelMap.forEach(i=>{try{i.pc.close();}catch(e){}});
   if(recReleaseTimer) clearTimeout(recReleaseTimer);
   if(recStream){ try{ recStream.getTracks().forEach(t=>t.stop()); }catch(e){} recStream=null; }

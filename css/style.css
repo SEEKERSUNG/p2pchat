@@ -136,6 +136,7 @@
 /* 语音消息（自定义播放器气泡，v2.13.0；v2.13.2 优化展示） */
 .msg.audio{padding:6px;background:transparent;max-width:84%}
 .msg.audio.in{align-self:flex-start}
+.msg.audio .img-expired{display:flex;align-items:center;justify-content:center;min-height:100px;background:var(--panel2);border-radius:8px;color:var(--mut);font-size:12px}
 .aud-msg{display:flex;align-items:center;gap:8px;min-width:190px;padding:7px 10px;border-radius:16px;background:var(--panel2)}
 .msg.out .aud-msg{background:rgba(255,255,255,.16)}
 .aud-play{flex:none;width:30px;height:30px;border-radius:50%;background:var(--acc);color:#fff;font-size:12px;padding:0;display:flex;align-items:center;justify-content:center;line-height:1}
