@@ -11,7 +11,7 @@
   <!-- 侧栏 -->
   <aside id="sidebar">
     <div class="side-head">
-      <h1>🌍 P2PChat<a class="gh-link" href="https://github.com/SEEKERSUNG/P2PChat" target="_blank" rel="noopener" title="GitHub 源码仓库">GitHub ↗</a><span class="ver">v2.13.6</span></h1>
+      <h1>🌍 P2PChat<a class="gh-link" href="https://github.com/SEEKERSUNG/P2PChat" target="_blank" rel="noopener" title="GitHub 源码仓库">GitHub ↗</a><span class="ver">v2.13.7</span></h1>
       <div class="me">我：<b id="myName">—</b> <span class="pill" id="myId">—</span></div>
       <div class="toolbar">
         <button onclick="startInvite()">➕ 新建连接</button>
@@ -96,8 +96,8 @@
   <div class="modal">
     <h2>设置</h2>
     <div class="field"><label>我的显示名</label><input id="setName"></div>
-    <div class="hint">已启用 <b>STUN 辅助</b>（始终开启）：使用国内公共 STUN（小米 / 腾讯 / B站）获取 IPv4 反射地址，并补充 Google STUN 获取 IPv6 反射地址，绕过 Chrome mDNS 混淆。仅在建连阶段联系 STUN，消息仍端到端加密、不经过 STUN。本机真实 IP 被 mDNS 隐藏时，侧栏将显示 STUN 反射的公网地址并标注。</div>
-    <div class="hint">Google STUN 用于 IPv6 反射兜底，国内可能不可达；不可达时退回 IPv4，不影响连接。需系统防火墙放行入站 UDP；STUN 仅能获取反射地址，仍需双方在同一局域网或均具公网 IP（不能穿越对称型 NAT）。</div>
+    <div class="hint">已启用 <b>STUN 辅助</b>（始终开启）：使用国内公共 STUN（小米 / 腾讯 / B站）获取 IPv4 反射地址，并补充 Cloudflare STUN（支持 IPv6，国内可达）与 Google STUN（候补）获取 IPv6 反射地址，绕过 Chrome mDNS 混淆。仅在建连阶段联系 STUN，消息仍端到端加密、不经过 STUN。本机真实 IP 被 mDNS 隐藏时，侧栏将显示 STUN 反射的公网地址并标注。</div>
+    <div class="hint">Google STUN 用于 IPv6 反射候补，国内可能不可达；不可达时退回 IPv4 或 Cloudflare IPv6，不影响连接。需系统防火墙放行入站 UDP；STUN 仅能获取反射地址，仍需双方在同一局域网或均具公网 IP（不能穿越对称型 NAT）。</div>
     <div class="hint">提示：因 WebRTC 会话信息每次临时生成，已保存联系人无法凭 IP 自动重连，每次重连仍需重新交换一次连接码。</div>
     <div class="actions">
       <button class="danger" onclick="logoutAccount()">退出账号</button>
@@ -249,6 +249,6 @@
 <div class="toast" id="toast"></div>
 <script src="lib/qrcode-generator.js"></script>
 <script src="lib/jsQR.min.js"></script>
-<script src="js/app.js?v=2.13.6"></script>
+<script src="js/app.js?v=2.13.7"></script>
 </body>
 </html>
