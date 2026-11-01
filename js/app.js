@@ -1,6 +1,8 @@
 ﻿"use strict";
 /* ===================== 数据层 ===================== */
 const STORE_KEY = "ipvchat_data";
+let saveWarned=false;
+let loadFailed=false;
 /* STUN 辅助始终启用：使用国内公共 STUN 获取 srflx 反射地址，绕过 Chrome mDNS 混淆
    （mDNS 把 host 候选改写为 *.local，跨子网/公网无法解析）。srflx 不受 mDNS 影响。
    国内 STUN 仅支持 IPv4；末尾补充 Google STUN（支持 IPv6 AAAA）以在 mDNS 隐藏公网 IPv6 时
@@ -30,13 +32,14 @@ let autoReviveRetries = new Map(); // contactId -> 重试次数（autoRevive 失
 const HEARTBEAT_INTERVAL = 12000; // 空闲心跳间隔
 
 function defaultStore(){
+  // messages/unread 使用无原型对象：避免对端身份 ID 恰好是 constructor/toString 等继承键时读到函数
   return {
     version:4,
     identity:{ id: randId(), name:"用户"+Math.floor(Math.random()*9000+1000) },
     contacts:[],
-    messages:{},
-    settings:{},
-    unread:{}
+    messages:Object.create(null),
+    settings:Object.create(null),
+    unread:Object.create(null)
   };
 }
 function loadStore(){
@@ -44,28 +47,95 @@ function loadStore(){
     const raw = localStorage.getItem(STORE_KEY);
     if(!raw) return defaultStore();
     return migrateStore(JSON.parse(raw));
-  }catch(e){ console.warn("load fail",e); return defaultStore(); }
+  }catch(e){ console.warn("load fail",e); loadFailed=true; return defaultStore(); }
 }
 /* 数据迁移：顶层字段补齐 + contact 字段迁移 + 版本归一。
    loadStore（启动加载）与 importJSON（导入备份）共用，保证两条入口行为一致（doc §6）。 */
 function migrateStore(d){
-    if(!d.identity) d.identity = defaultStore().identity;
-    if(!d.contacts) d.contacts = [];
-    if(!d.messages) d.messages = {};
-    if(!d.settings) d.settings = {};
-    if(!d.unread) d.unread = {};
-    // 迁移：分离「对端用户名 peerName」与「自定义备注 name」
-    d.contacts.forEach(c=>{
-      if(c.nameSet===undefined) c.nameSet=false;
-      if(c.peerName===undefined) c.peerName = c.nameSet ? '' : (c.name||'');
-      // v2.7.6: 补 seq 回执字段（旧数据无 seq 回退时间戳判断）
-      if(c.peerDeliveredSeq===undefined) c.peerDeliveredSeq = -1;
-      if(c.peerReadSeq===undefined) c.peerReadSeq = -1;
+  if(!d || typeof d!=='object' || Array.isArray(d)) d=defaultStore();
+  if(!d.identity || typeof d.identity!=='object' || Array.isArray(d.identity)) d.identity = defaultStore().identity;
+  if(!isSafePeerId(d.identity.id)) d.identity.id = randId();
+  d.identity.name = normalizeName(d.identity.name) || ("用户"+Math.floor(Math.random()*9000+1000));
+  if(!Array.isArray(d.contacts)) d.contacts = [];
+  const seenContactIds=new Set();
+  d.contacts = d.contacts.filter(c=>{
+    if(!c || typeof c!=='object' || Array.isArray(c) || !isSafePeerId(c.id) || seenContactIds.has(c.id)) return false;
+    seenContactIds.add(c.id); return true;
+  });
+  // messages 使用无原型对象，杜绝 __proto__/constructor 等键影响查找
+  const srcMessages = (d.messages && typeof d.messages==='object' && !Array.isArray(d.messages)) ? d.messages : {};
+  const messages=Object.create(null);
+  Object.keys(srcMessages).forEach(k=>{
+    if(!Array.isArray(srcMessages[k])) return;
+    const arr=srcMessages[k].filter(m=>m && typeof m==='object' && !Array.isArray(m));
+    arr.forEach(m=>{
+      // 导入数据/旧数据字段校验：避免非数字 ts、畸形媒体元数据进入渲染层
+      if(typeof m.ts!=='number' || !isFinite(m.ts)) m.ts = Number(m.ts);
+      if(typeof m.ts!=='number' || !isFinite(m.ts)) m.ts = nowTs();
+      if(m.seq!==undefined && (typeof m.seq!=='number' || !isFinite(m.seq))) delete m.seq;
+      if(m.pending!==undefined) m.pending=!!m.pending;
+      ['file','image','video','audio'].forEach(kind=>{
+        const x=m[kind];
+        if(x===undefined) return;
+        if(!x || typeof x!=='object' || Array.isArray(x)){ delete m[kind]; return; }
+        const idKey = kind==='file'?'fid':kind==='image'?'iid':kind==='video'?'vid':'aid';
+        if(!isSafeTransferId(x[idKey])){ delete m[kind]; return; }
+        if(typeof x.name==='string') x.name=x.name.slice(0,255);
+        else x.name='';
+        if(typeof x.size!=='number' || !isFinite(x.size) || x.size<0) x.size=0;
+      });
     });
-    d.version = 4; // v4 起仅直连，忽略历史 STUN 配置
-    return d;
+    messages[k]=arr;
+  });
+  d.messages=messages;
+  const srcSettings = (d.settings && typeof d.settings==='object' && !Array.isArray(d.settings)) ? d.settings : {};
+  const settings=Object.create(null);
+  Object.keys(srcSettings).forEach(k=>{ settings[k]=srcSettings[k]; });
+  d.settings=settings;
+  const srcUnread = (d.unread && typeof d.unread==='object' && !Array.isArray(d.unread)) ? d.unread : {};
+  const unread=Object.create(null);
+  Object.keys(srcUnread).forEach(k=>{
+    const n=Number(srcUnread[k]);
+    if(isFinite(n) && n>0) unread[k]=Math.floor(n);
+  });
+  d.unread=unread;
+  // 迁移：分离「对端用户名 peerName」与「自定义备注 name」
+  d.contacts.forEach(c=>{
+    if(c.nameSet===undefined) c.nameSet=false;
+    c.nameSet = c.nameSet===true;
+    c.name = normalizeName(c.name);
+    if(c.peerName===undefined) c.peerName = c.nameSet ? '' : c.name;
+    c.peerName = normalizeName(c.peerName);
+    if(typeof c.ip!=='string') c.ip='';
+    if(typeof c.note!=='string') c.note='';
+    if(typeof c.ipType!=='string') delete c.ipType;
+    if(typeof c.lastSeen!=='number' || !isFinite(c.lastSeen)) c.lastSeen=0;
+    if(c.lastReadTs!==undefined && (typeof c.lastReadTs!=='number' || !isFinite(c.lastReadTs))) delete c.lastReadTs;
+    if(c.peerReadTs!==undefined && (typeof c.peerReadTs!=='number' || !isFinite(c.peerReadTs))) delete c.peerReadTs;
+    if(c.peerDeliveredTs!==undefined && (typeof c.peerDeliveredTs!=='number' || !isFinite(c.peerDeliveredTs))) delete c.peerDeliveredTs;
+    // v2.7.6: 补 seq 回执字段（旧数据无 seq 回退时间戳判断）
+    if(typeof c.peerDeliveredSeq!=='number' || !isFinite(c.peerDeliveredSeq)) c.peerDeliveredSeq = -1;
+    if(typeof c.peerReadSeq!=='number' || !isFinite(c.peerReadSeq)) c.peerReadSeq = -1;
+    // 出站 seq 持久基线：清空聊天记录/导入旧备份后仍保持单调递增
+    if(typeof c.outSeqNext!=='number' || !isFinite(c.outSeqNext) || c.outSeqNext<0) c.outSeqNext = 0;
+    if(c.peerIps!==undefined){
+      if(!Array.isArray(c.peerIps)) delete c.peerIps;
+      else c.peerIps=sanitizePeerIps(c.peerIps);
+    }
+  });
+  d.version = 4; // v4 起仅直连，忽略历史 STUN 配置
+  return d;
 }
-function saveStore(){ try{ localStorage.setItem(STORE_KEY, JSON.stringify(store)); }catch(e){ console.warn("save fail",e); } }
+function saveStore(){
+  try{ localStorage.setItem(STORE_KEY, JSON.stringify(store)); }
+  catch(e){
+    console.warn("save fail",e);
+    if(!saveWarned){ // 只提示一次，避免每条消息都弹 toast
+      saveWarned=true;
+      try{ toast("本地保存失败：存储空间可能已满，聊天记录可能丢失"); }catch(_){}
+    }
+  }
+}
 let _saveTimer=null;
 /* v2.13.6 防抖落盘：合并高频写入——接收消息/ACK/回执原本每次都全量 JSON.stringify 整个 store，
    长聊天记录下每条消息都是 O(总量) 开销。仅用于高频路径（addMessage/回执/媒体消息）；
@@ -82,6 +152,24 @@ function flushSave(){
 }
 
 function randId(){ return "p"+Math.random().toString(36).slice(2,10)+Date.now().toString(36).slice(-4); }
+/* 对端身份 ID 会用作 contacts/messages/unread 的对象键，限制为安全格式，避免 __proto__ 等特殊键 */
+function isSafePeerId(id){
+  return typeof id==='string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(id) && id!=='__proto__';
+}
+/* 用户名/备注统一裁剪，避免超长名称撑爆列表、信令与本地存储 */
+function normalizeName(v){ return typeof v==='string' ? v.trim().slice(0,32) : ''; }
+function isMetaSize(v){ return typeof v==='number' && Number.isInteger(v) && v>=0; }
+/* 媒体传输 ID（fid/iid/vid/aid）会进入 DOM id/内联属性和 Map 键，限制为安全字符 */
+function isSafeTransferId(id){ return typeof id==='string' && /^[A-Za-z0-9_-]{1,64}$/.test(id); }
+function safeMetaName(v, fallback){ return typeof v==='string' && v ? v.slice(0,255) : fallback; }
+const SAFE_IMAGE_MIME = /^image\/(?:png|jpe?g|gif|webp|bmp|avif|heic|heif)$/i;
+function isSafeImageMime(mime){ return typeof mime==='string' && SAFE_IMAGE_MIME.test(mime); }
+/* 发送端 MIME 归一化：部分相机/文件选择器拿不到 type，按 JPEG 处理；明确不支持的类型返回空串 */
+function normalizeImageMime(mime){
+  if(isSafeImageMime(mime)) return mime;
+  if(!mime) return 'image/jpeg';
+  return '';
+}
 function nowTs(){ return Date.now(); }
 function fmtTime(ts){
   const d = new Date(ts), p=n=>String(n).padStart(2,'0');
@@ -104,8 +192,10 @@ function contactDisplayHtml(c){
 }
 function ensureContact(peerId, name){
   let c = getContact(peerId);
-  if(!c){ c={id:peerId,name:"",ip:"",lastSeen:0,note:"",nameSet:false,peerName:name||("用户"+Math.floor(Math.random()*9000+1000))}; store.contacts.push(c); }
-  if(name) c.peerName = name; // 每次连接同步对端账号用户名
+  const nm = normalizeName(name);
+  if(!c){ c={id:peerId,name:"",ip:"",lastSeen:0,note:"",nameSet:false,peerName:nm||("用户"+Math.floor(Math.random()*9000+1000)),peerDeliveredSeq:-1,peerReadSeq:-1,outSeqNext:0}; store.contacts.push(c); }
+  if(nm) c.peerName = nm; // 每次连接同步对端账号用户名
+  if(typeof c.outSeqNext!=='number' || !isFinite(c.outSeqNext)) c.outSeqNext = 0;
   return c;
 }
 function isMobile(){ return window.matchMedia && window.matchMedia('(max-width:680px)').matches; }
@@ -144,12 +234,19 @@ function newPC(){
   // STUN 辅助始终启用：填入国内公共 STUN，收集 srflx 候选绕过 mDNS 混淆
   const pc = new RTCPeerConnection({ iceServers: DEFAULT_STUN_SERVERS });
   // 默认处理对端在存活通道上新开的 DataChannel（用于免交换码恢复）
-  pc.ondatachannel = e=>{ if(!channelMap.has(e.channel)) bindChannel(e.channel, pc, null, null, e.channel.label==='chat'); };
+  pc.ondatachannel = e=>{
+    if(e.channel.label!=='chat' && e.channel.label!=='file'){ try{ e.channel.close(); }catch(_){} return; }
+    if(!channelMap.has(e.channel)) bindChannel(e.channel, pc, null, null, e.channel.label==='chat');
+  };
   return pc;
 }
 
 /* 探测本机 IP（IPv4/IPv6）：用 WebRTC ICE host 候选收集（仅直连，无 STUN，避免 srflx 污染本机地址） */
-function isRealIp(a){ return !!a && !a.endsWith('.local') && a!=='0.0.0.0' && a!=='::'; }
+function isRealIp(a){ return typeof a==='string' && !!a && !a.endsWith('.local') && a!=='0.0.0.0' && a!=='::'; }
+/* 连接码中的 ips 只用于展示/回退，限制数量与单项长度，避免恶意码撑爆 UI/存储 */
+function sanitizePeerIps(v){
+  return Array.isArray(v) ? v.filter(x=>typeof x==='string' && x && x.length<=64).slice(0,16) : null;
+}
 /* 核心收集：创建临时 PC（启用 STUN）收集 host / srflx 候选，返回 {host4,host6,mdns,srflx}（均为 Set）。
    srflx 为 STUN 反射的公网地址，不受 mDNS 影响——本机真实 IP 被隐藏时用它展示与连接。 */
 async function collectMyIps(){
@@ -267,12 +364,13 @@ async function encodeSignal(obj){
 }
 async function decodeSignal(s){
   s = s.trim();
+  if(s.length > 512*1024) throw new Error("连接码过长");
   const head = s[0];
   let json;
   if(head === 'z'){
     const bytes = b64ToBytes(s.slice(1));
     const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
-    const buf = await new Response(stream).arrayBuffer();
+    const buf = await readStreamLimited(stream, 4*1024*1024); // 防止解压炸弹
     json = new TextDecoder().decode(buf);
   }else if(head === 'b'){
     json = b64ToUtf8(s.slice(1));
@@ -280,6 +378,27 @@ async function decodeSignal(s){
     json = b64ToUtf8(s); // 兼容旧版无前缀连接码
   }
   return JSON.parse(json);
+}
+/* 限制解压后的连接码大小，避免恶意压缩数据耗尽内存 */
+async function readStreamLimited(stream, maxBytes){
+  const reader = stream.getReader();
+  const chunks=[]; let total=0;
+  try{
+    while(true){
+      const {done, value} = await reader.read();
+      if(done) break;
+      total += value.byteLength;
+      if(total > maxBytes) throw new Error("连接码解压后过大");
+      chunks.push(value);
+    }
+  }catch(e){
+    try{ await reader.cancel(); }catch(_){}
+    throw e;
+  }
+  const out = new Uint8Array(total);
+  let off=0;
+  for(const c of chunks){ out.set(c, off); off += c.byteLength; }
+  return out;
 }
 
 /* ===== 二维码生成与扫描（v2.9.0）=====
@@ -289,7 +408,7 @@ async function decodeSignal(s){
 /* 生成二维码并弹窗展示 */
 function showQrCode(text, title){
   if(typeof qrcode === 'undefined') return toast("二维码库未加载");
-  if(!text) return toast("暂无内容可生成二维码");
+  if(!text || text.indexOf('⏳')===0) return toast("暂无内容可生成二维码");
   let qr;
   try{
     qr = qrcode(0, 'L'); // typeNumber=0 自动选最小版本，纠错级 L（7%）：屏幕二维码无污损，L 级模块数最少、每块最大，最易扫描
@@ -367,9 +486,13 @@ function shareQr(canvas, title){
   },'image/png');
 }
 /* 扫描二维码：摄像头实时识别 + 上传图片识别，成功回调 callback(text) */
-let scanStream=null, scanRAF=null;
+let scanStream=null, scanRAF=null, scanToken=0;
 function showQrScanner(callback){
   if(typeof jsQR === 'undefined') return toast("二维码库未加载");
+  const token=++scanToken;
+  // 停止上一次可能仍在运行的相机流/帧循环
+  if(scanRAF){ cancelAnimationFrame(scanRAF); scanRAF=null; }
+  if(scanStream){ scanStream.getTracks().forEach(t=>t.stop()); scanStream=null; }
   const ov=document.getElementById('dlgScan');
   const video=document.getElementById('scanVideo');
   const status=document.getElementById('scanStatus');
@@ -381,20 +504,23 @@ function showQrScanner(callback){
     return;
   }
   navigator.mediaDevices.getUserMedia({video:{facingMode:'environment', width:{ideal:1280}, height:{ideal:720}}}).then(stream=>{
+    // 等待授权期间用户可能已关闭扫码弹窗：此时必须立刻释放摄像头
+    if(token!==scanToken){ stream.getTracks().forEach(t=>t.stop()); return; }
     scanStream=stream; video.srcObject=stream;
     video.play().catch(()=>{});
     status.textContent='将二维码对准摄像头…';
-    scanLoop(video, (text)=>{ closeScanner(); callback(text); });
+    scanLoop(video, (text)=>{ closeScanner(); callback(text); }, token);
   }).catch(e=>{
+    if(token!==scanToken) return;
     status.textContent='摄像头不可用：'+(e.message||e.name)+'。请改用「📁 上传二维码」按钮';
   });
 }
-function scanLoop(video, onFound){
+function scanLoop(video, onFound, token){
   const canvas=document.createElement('canvas');
   const ctx=canvas.getContext('2d',{willReadFrequently:true});
   const MAX=640; // 降采样上限：jsQR 解析速度与帧率平衡，帧率高→尝试次数多→命中率高
   const tick=()=>{
-    if(!scanStream) return; // 已关闭则停止
+    if(token!==scanToken || !scanStream) return; // 已关闭或已开始新的扫码会话
     if(video.readyState>=video.HAVE_ENOUGH_DATA && video.videoWidth){
       const vw=video.videoWidth, vh=video.videoHeight;
       const scale=Math.min(1, MAX/Math.max(vw,vh));
@@ -402,7 +528,8 @@ function scanLoop(video, onFound){
       canvas.width=w; canvas.height=h;
       ctx.drawImage(video,0,0,w,h);
       const img=ctx.getImageData(0,0,w,h);
-      const code=jsQR(img.data, w, h, {inversionAttempts:'attemptBoth'});
+      let code=null;
+      try{ code=jsQR(img.data, w, h, {inversionAttempts:'attemptBoth'}); }catch(e){}
       if(code && code.data){ onFound(code.data); return; }
     }
     scanRAF=requestAnimationFrame(tick);
@@ -421,13 +548,15 @@ function decodeQrImage(img){
     const x=c.getContext('2d',{willReadFrequently:true});
     x.drawImage(img,0,0,w,h);
     const imgData=x.getImageData(0,0,w,h);
-    const code=jsQR(imgData.data, w, h, {inversionAttempts:'attemptBoth'});
+    let code=null;
+    try{ code=jsQR(imgData.data, w, h, {inversionAttempts:'attemptBoth'}); }catch(e){}
     if(code && code.data) return code.data;
   }
   return null;
 }
 /* 关闭扫描：停止摄像头流与帧循环 */
 function closeScanner(){
+  scanToken++; // 使等待中的 getUserMedia 回调失效
   if(scanRAF) cancelAnimationFrame(scanRAF); scanRAF=null;
   if(scanStream){ scanStream.getTracks().forEach(t=>t.stop()); scanStream=null; }
   const v=document.getElementById('scanVideo'); if(v) v.srcObject=null;
@@ -466,9 +595,18 @@ function uploadQrTo(textareaId){
 function hasRealHostCandidate(pc){
   const sdp = (pc.localDescription && pc.localDescription.sdp) || '';
   return sdp.split('\n').some(l=>{
-    if(!l.startsWith('a=candidate=') || !l.includes(' typ host')) return false;
+    if(!l.startsWith('a=candidate:') || !l.includes(' typ host')) return false;
     const addr = l.split(' ')[4];
-    return addr && !addr.endsWith('.local');
+    return isRealIp(addr);
+  });
+}
+/* 是否收集到任何可用的 ICE 候选（包括 mDNS/srflx）；为 0 说明浏览器/网络禁用了 WebRTC，连接码无效 */
+function hasAnyCandidate(pc){
+  const sdp = (pc.localDescription && pc.localDescription.sdp) || '';
+  return sdp.split('\n').some(l=>{
+    if(!l.startsWith('a=candidate:')) return false;
+    const addr = l.split(' ')[4];
+    return addr && addr!=='0.0.0.0' && addr!=='::';
   });
 }
 /* 从已收集完成的 localDescription 中提取本机真实 IP（host + srflx，排除 .local）。
@@ -477,7 +615,7 @@ function extractIpsFromPc(pc){
   const sdp = (pc.localDescription && pc.localDescription.sdp) || '';
   const ips = new Set();
   sdp.split('\n').forEach(l=>{
-    if(!l.startsWith('a=candidate=')) return;
+    if(!l.startsWith('a=candidate:')) return;
     const parts = l.split(' ');
     const addr = parts[4], typ = parts[7];
     if(!addr || !typ) return;
@@ -488,11 +626,18 @@ function extractIpsFromPc(pc){
 
 /* 连接诊断：STUN 始终启用，根据本机是否有真实 host 候选 / 对端 IP 给出场景化提示 */
 function connectDiagnose(pc){
+  if(!hasAnyCandidate(pc)){
+    return `⚠ 连接未建立。本机未收集到任何 ICE 候选（浏览器/网络可能禁用了 WebRTC），请检查浏览器权限、代理/防火墙或换用支持 WebRTC 的浏览器。`;
+  }
   const hasReal = hasRealHostCandidate(pc);
   const c = currentId && getContact(currentId);
   const peerIps = (c && c.peerIps) || pendingPeerIps || [];
   const peerStr = peerIps.length ? `对端地址：${peerIps.join(' / ')}。` : '';
   if(!hasReal){
+    const localIps = extractIpsFromPc(pc);
+    if(!localIps.length){
+      return `⚠ 连接未建立。仅收集到 mDNS（*.local）候选，STUN 未返回反射地址。请确认网络可访问 STUN 服务器，或双方在同一局域网且 mDNS 可解析。${peerStr}`;
+    }
     return `⚠ 连接未建立。本机真实 IP 被 mDNS 隐藏（*.local），已通过 STUN 获取反射地址。若仍失败请确认：①系统防火墙放行入站 UDP ②网络可访问 STUN 服务器 ③双方在同一局域网或均具公网 IP。${peerStr}`;
   }
   return `⚠ 连接未建立。本机已暴露真实 IP，请确认对端：①防火墙放行入站 UDP ②未因 mDNS 隐藏真实 IP ③与你在同一局域网或具公网 IP。${peerStr}`;
@@ -502,10 +647,10 @@ function connectDiagnose(pc){
 function revokeContactUrls(contactId){
   const arr = store.messages[contactId] || [];
   for(const m of arr){
-    if(m.file && m.file.fid){ const u=fileUrls.get(m.file.fid); if(u){ URL.revokeObjectURL(u); fileUrls.delete(m.file.fid); } }
-    if(m.image && m.image.iid){ const u=imageUrls.get(m.image.iid); if(u){ URL.revokeObjectURL(u); imageUrls.delete(m.image.iid); } }
-    if(m.video && m.video.vid){ const u=videoUrls.get(m.video.vid); if(u){ URL.revokeObjectURL(u); videoUrls.delete(m.video.vid); } }
-    if(m.audio && m.audio.aid){ const u=audioUrls.get(m.audio.aid); if(u){ URL.revokeObjectURL(u); audioUrls.delete(m.audio.aid); } }
+    if(m.file && m.file.fid){ const u=fileUrls.get(m.file.fid); if(u){ URL.revokeObjectURL(u); fileUrls.delete(m.file.fid); } failedTransfers.delete(m.file.fid); }
+    if(m.image && m.image.iid){ const u=imageUrls.get(m.image.iid); if(u){ URL.revokeObjectURL(u); imageUrls.delete(m.image.iid); } failedTransfers.delete(m.image.iid); }
+    if(m.video && m.video.vid){ const u=videoUrls.get(m.video.vid); if(u){ URL.revokeObjectURL(u); videoUrls.delete(m.video.vid); } failedTransfers.delete(m.video.vid); }
+    if(m.audio && m.audio.aid){ const u=audioUrls.get(m.audio.aid); if(u){ URL.revokeObjectURL(u); audioUrls.delete(m.audio.aid); } failedTransfers.delete(m.audio.aid); }
   }
 }
 /* 清理所有传输 objectURL（退出时调用） */
@@ -559,6 +704,7 @@ async function quickReconnect(){
   if(!currentId) return;
   const c=getContact(currentId); if(!c) return;
   if(connections.has(currentId)){ toast("已处于连接状态"); return; }
+  cancelAutoRevive(currentId); // 手动重连优先，避免自动恢复定时器同时发起
   // 1) 先尝试恢复
   if(revivable.has(currentId)){
     showConnectDialog([{step:`正在尝试恢复与「${escapeHtml(contactDisplayText(c))}」的连接…`, body:`
@@ -597,51 +743,90 @@ function attemptRevive(contactId){
       // 不破坏 PC，保留 revivable 供后续重试（attemptRevive 重开 DataChannel 需 ICE 已连通）。
       res(false); return;
     }
-    let chatCh, fileCh;
+    let chatCh, fileCh, settled=false, waitTimer=null, to=null, revived=false;
+    const finish=(ok)=>{
+      if(settled) return;
+      settled=true;
+      revived=!!ok;
+      clearTimeout(to);
+      if(waitTimer) clearInterval(waitTimer);
+      if(!ok){ try{ chatCh&&chatCh.close(); }catch(e){} try{ fileCh&&fileCh.close(); }catch(e){} }
+      res(ok);
+    };
     try{
       chatCh = pc.createDataChannel('chat',{ordered:true});
       fileCh = pc.createDataChannel('file',{ordered:true});
     }
     catch(e){ res(false); return; }
-    let opened=0;
-    const to=setTimeout(()=>{ try{chatCh.close();fileCh.close();}catch(e){} res(false); }, 5000);
-    const onOpen=(ch,isC)=>{ opened++; bindChannel(ch, pc, null, null, isC); if(opened>=2){ clearTimeout(to); res(true); } };
+    to=setTimeout(()=>finish(false), 8000);
+    const onOpen=(ch,isC)=>{
+      // 恢复成功后迟到的 file 通道也需要绑定，否则媒体传输不可用；失败后不再绑定
+      if(settled){
+        if(revived && !channelMap.has(ch) && ch.readyState==='open') bindChannel(ch, pc, null, null, isC);
+        return;
+      }
+      if(!channelMap.has(ch) && ch.readyState==='open') bindChannel(ch, pc, null, null, isC);
+      // chat 打开后必须等 hello 双侧登记完成，避免旧版对端只完成单向登记
+      if(isC && !waitTimer){
+        const t0=Date.now();
+        waitTimer=setInterval(()=>{
+          if(settled){ clearInterval(waitTimer); return; }
+          if(connections.has(contactId)) finish(true);
+          else if(Date.now()-t0>3000) finish(false);
+        },100);
+      }
+    };
     chatCh.onopen=()=>onOpen(chatCh, true);
     fileCh.onopen=()=>onOpen(fileCh, false);
-    chatCh.onerror=()=>{ clearTimeout(to); res(false); };
-    fileCh.onerror=()=>{ clearTimeout(to); res(false); };
+    chatCh.onerror=()=>finish(false);
+    fileCh.onerror=()=>finish(false);
   });
 }
 
 /* 邀请方：生成邀请码 */
 async function startInvite(){
+  if(currentId){ cancelAutoRevive(currentId); autoReviveRetries.delete(currentId); } // 手动建连优先
   showConnectDialog([{step:"第 1 步 · 正在生成邀请码", body:`
     <div class="gen-loading"><span class="spinner"></span>正在创建加密连接、收集 STUN 反射地址…</div>`}]);
   cleanupPending();
-  const pc = newPC(); pendingPC = pc;
-  const chatCh = pc.createDataChannel("chat",{ordered:true});
-  const fileCh = pc.createDataChannel("file",{ordered:true});
-  bindChannel(chatCh, pc, null, null, true);
-  bindChannel(fileCh, pc, null, null, false);
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  await waitIceComplete(pc);
-  if(pendingPC !== pc) return; // 用户在等待期间点了取消，中止生成
-  // 不在此处启动连接看门狗：邀请方还在等对方人工回发应答码，交换时间不可控，不应计入连通超时。
-  // 看门狗改在 finalizeOffer() 提交应答码、真正开始 ICE 连通后启动。
-  const mdnsWarn = hasRealHostCandidate(pc) ? '' :
-    '<div class="mi-note">ℹ 本机真实 IP 被 mDNS 隐藏（*.local），已通过 STUN 辅助获取反射地址以保障连接。</div>';
-  const code = await encodeSignal({type:"offer", sdp: pc.localDescription, identity: store.identity, ips: extractIpsFromPc(pc)});
-  showConnectDialog([
-    {step:"第 1 步（共 3 步） · 你是邀请方", body:`
-      <p style="font-size:12px;color:var(--mut)">把下面的<b>邀请码</b>发给对方（任意聊天工具），让对方点「接受连接」并粘贴。</p>
-      <textarea class="codebox" id="codeOut" readonly>${code}</textarea>
-      ${mdnsWarn}
-      <div class="row"><button onclick="copyText(document.getElementById('codeOut').value)">复制邀请码</button><button class="ghost" onclick="showQrCode(document.getElementById('codeOut').value,'邀请码二维码')">📱 二维码</button></div>`},
-    {step:"第 3 步 · 等对方回发应答码后粘贴", body:`
-      <textarea class="codebox" id="codeIn" placeholder="在此粘贴对方回发的应答码..."></textarea>
-      <div class="row"><button onclick="finalizeOffer()">完成连接</button><button class="ghost" onclick="scanTo('codeIn')">📷 相机扫码</button><button class="ghost" onclick="uploadQrTo('codeIn')">📁 上传二维码</button></div>`}
-  ]);
+  let pc=null;
+  try{
+    pc = newPC(); pendingPC = pc;
+    const chatCh = pc.createDataChannel("chat",{ordered:true});
+    const fileCh = pc.createDataChannel("file",{ordered:true});
+    bindChannel(chatCh, pc, null, null, true);
+    bindChannel(fileCh, pc, null, null, false);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await waitIceComplete(pc);
+    if(pendingPC !== pc) return; // 用户在等待期间点了取消，中止生成
+    // 不在此处启动连接看门狗：邀请方还在等对方人工回发应答码，交换时间不可控，不应计入连通超时。
+    // 看门狗改在 finalizeOffer() 提交应答码、真正开始 ICE 连通后启动。
+    const ips=extractIpsFromPc(pc);
+    const mdnsWarn = !hasAnyCandidate(pc) ?
+      '<div class="mi-note">⚠ 未收集到任何 ICE 候选（浏览器/网络可能禁用了 WebRTC），此邀请码可能无法建立连接。</div>' :
+      (hasRealHostCandidate(pc) ? '' :
+        (ips.length ?
+          '<div class="mi-note">ℹ 本机真实 IP 被 mDNS 隐藏（*.local），已通过 STUN 辅助获取反射地址以保障连接。</div>' :
+          '<div class="mi-note">⚠ 仅收集到 mDNS（*.local）候选，STUN 未返回反射地址；跨子网/公网可能无法连接。</div>'));
+    const code = await encodeSignal({type:"offer", sdp: pc.localDescription, identity: store.identity, ips});
+    if(pendingPC !== pc) return; // 压缩编码期间用户取消
+    showConnectDialog([
+      {step:"第 1 步（共 3 步） · 你是邀请方", body:`
+        <p style="font-size:12px;color:var(--mut)">把下面的<b>邀请码</b>发给对方（任意聊天工具），让对方点「接受连接」并粘贴。</p>
+        <textarea class="codebox" id="codeOut" readonly>${code}</textarea>
+        ${mdnsWarn}
+        <div class="row"><button onclick="copyText(document.getElementById('codeOut').value)">复制邀请码</button><button class="ghost" onclick="showQrCode(document.getElementById('codeOut').value,'邀请码二维码')">📱 二维码</button></div>`},
+      {step:"第 3 步 · 等对方回发应答码后粘贴", body:`
+        <textarea class="codebox" id="codeIn" placeholder="在此粘贴对方回发的应答码..."></textarea>
+        <div class="row"><button onclick="finalizeOffer()">完成连接</button><button class="ghost" onclick="scanTo('codeIn')">📷 相机扫码</button><button class="ghost" onclick="uploadQrTo('codeIn')">📁 上传二维码</button></div>`}
+    ]);
+  }catch(e){
+    if(pendingPC !== pc) return; // 已取消或被新的握手流程替换
+    cleanupPending();
+    closeDialog('dlgConnect');
+    toast("创建连接失败: "+(e.message||e));
+  }
 }
 async function finalizeOffer(){
   const s = document.getElementById('codeIn').value.trim();
@@ -650,8 +835,10 @@ async function finalizeOffer(){
   if(!pc) return toast("连接已取消，请重新开始");
   try{
     const obj = await decodeSignal(s);
+    if(pendingPC !== pc) return; // 解码期间用户取消
     if(obj.type!=='answer') return toast("这不是应答码");
-    pendingPeerIps = Array.isArray(obj.ips) ? obj.ips : null; // 暂存对端真实 IP
+    if(!obj.sdp) return toast("应答码无效");
+    pendingPeerIps = sanitizePeerIps(obj.ips); // 暂存对端真实 IP
     await pc.setRemoteDescription(new RTCSessionDescription(obj.sdp));
     if(pendingPC !== pc) return; // 用户在等待期间点了取消，中止
     toast("已提交，正在建立连接…", 3000);
@@ -662,6 +849,7 @@ async function finalizeOffer(){
 
 /* 被邀方：粘贴邀请码，生成应答码 */
 async function startAccept(){
+  if(currentId){ cancelAutoRevive(currentId); autoReviveRetries.delete(currentId); } // 手动建连优先
   cleanupPending();
   showConnectDialog([
     {step:"第 2 步 · 你是被邀方", body:`
@@ -670,30 +858,38 @@ async function startAccept(){
       <div class="row"><button onclick="acceptOffer()">生成应答码</button><button class="ghost" onclick="scanTo('codeIn')">📷 相机扫码</button><button class="ghost" onclick="uploadQrTo('codeIn')">📁 上传二维码</button></div>`},
     {step:"生成后 · 把应答码回发给对方", body:`
       <textarea class="codebox" id="codeOut" readonly placeholder="应答码将显示在这里..."></textarea>
+      <div id="answerWarn" class="mi-note" style="display:none"></div>
       <div class="row"><button onclick="copyText(document.getElementById('codeOut').value)">复制应答码</button><button class="ghost" onclick="showQrCode(document.getElementById('codeOut').value,'应答码二维码')">📱 二维码</button></div>`}
   ]);
 }
 async function acceptOffer(){
   const s = document.getElementById('codeIn').value.trim();
   if(!s) return toast("请粘贴邀请码");
+  let pc=null;
   try{
     const obj = await decodeSignal(s);
     if(obj.type!=='offer') return toast("这不是邀请码");
+    if(!obj.identity || !isSafePeerId(obj.identity.id)) return toast("邀请码缺少身份信息");
+    if(!obj.sdp) return toast("邀请码无效");
+    // 解码期间用户可能已关闭向导，不要重新创建握手 PC
+    if(!document.getElementById('dlgConnect').classList.contains('show')) return;
+    const peerId=obj.identity.id;
+    const peerName=normalizeName(obj.identity.name);
     // v2.13.5：先清理上一次 acceptOffer 残留的 PC（重复点击 / 上次 SDP 无效留下的废 PC），防止泄漏。
     // 必须置于 pendingPeerIps 赋值之前——cleanupPending 会清空 pendingPeerIps。
-    // 在途的那次生成会经 pendingPC !== pc 检查安全中止（与 startInvite 同模式）。
     cleanupPending();
-    pendingPeerIps = Array.isArray(obj.ips) ? obj.ips : null; // 暂存对端真实 IP
-    // 立即显示生成中提示，避免用户以为点击无反应（STUN 收集候选需要网络往返）
+    pendingPeerIps = sanitizePeerIps(obj.ips); // 暂存对端真实 IP
     const co=document.getElementById('codeOut');
     if(co){ co.value='⏳ 正在生成应答码，收集 STUN 反射地址…'; }
     toast("正在生成应答码…", 3000);
-    const pc = newPC(); pendingPC = pc;
+    pc = newPC(); pendingPC = pc;
     pc.ondatachannel = e=>{
       if(e.channel.label==='chat'){
-        bindChannel(e.channel, pc, obj.identity.id, obj.identity.name, true);
+        bindChannel(e.channel, pc, peerId, peerName, true);
       } else if(e.channel.label==='file'){
         bindChannel(e.channel, pc, null, null, false);
+      } else {
+        try{ e.channel.close(); }catch(_){}
       }
     };
     await pc.setRemoteDescription(new RTCSessionDescription(obj.sdp));
@@ -702,19 +898,33 @@ async function acceptOffer(){
     await waitIceComplete(pc);
     if(pendingPC !== pc) return; // 用户在等待期间点了取消，中止生成
     // v2.13.5：不启动连接看门狗——与邀请方对称。应答码仍需人工回传给邀请方（扫码/复制粘贴），
-    // 交换时间不可控，不应计入连通超时（旧版把它计入，邀请方超 90s 才粘贴时被邀方 PC 被销毁，
-    // 之后 ICE 必然无法建立）。硬失败由 ICE failed 事件即时报错（bindChannel 已监听），
-    // 无人来连则 PC 留待用户取消时清理（cleanupPending），与 v2.7.9 对邀请方的取舍一致。
-    if(!hasRealHostCandidate(pc)) toast("ℹ 本机真实 IP 被 mDNS 隐藏，已通过 STUN 辅助获取反射地址", 5000);
-    const code = await encodeSignal({type:"answer", sdp: pc.localDescription, identity: store.identity, ips: extractIpsFromPc(pc)});
-    document.getElementById('codeOut').value = code;
+    // 交换时间不可控；硬失败由 ICE failed 事件即时报错。
+    const localIps=extractIpsFromPc(pc);
+    const candWarn = !hasAnyCandidate(pc) ?
+      '⚠ 未收集到任何 ICE 候选（浏览器/网络可能禁用了 WebRTC），此应答码可能无法建立连接。' :
+      (hasRealHostCandidate(pc) ? '' :
+        (localIps.length ?
+          'ℹ 本机真实 IP 被 mDNS 隐藏（*.local），已通过 STUN 辅助获取反射地址。' :
+          '⚠ 仅收集到 mDNS（*.local）候选，STUN 未返回反射地址；跨子网/公网可能无法连接。'));
+    const code = await encodeSignal({type:"answer", sdp: pc.localDescription, identity: store.identity, ips: localIps});
+    if(pendingPC !== pc) return; // 压缩编码期间用户取消
+    const out=document.getElementById('codeOut');
+    if(out) out.value = code;
+    const warnEl=document.getElementById('answerWarn');
+    if(warnEl){ warnEl.textContent = candWarn; warnEl.style.display = candWarn ? '' : 'none'; }
     toast("已生成应答码，请复制回发给对方");
-  }catch(e){ toast("邀请码无效: "+e.message); }
+  }catch(e){
+    if(pc && pendingPC===pc) cleanupPending();
+    const co=document.getElementById('codeOut');
+    if(co && co.value.indexOf('⏳')===0) co.value='';
+    toast("邀请码无效: "+e.message);
+  }
 }
 
 function bindChannel(channel, pc, knownPeerId, knownPeerName, isChat){
   channel.binaryType='arraybuffer'; // 接收文件分块用 ArrayBuffer
-  channelMap.set(channel, {pc, contactId: knownPeerId||null, isChat: !!isChat});
+  const info={pc, contactId: knownPeerId||null, isChat: !!isChat, opened:false};
+  channelMap.set(channel, info);
   channel.onopen = ()=> onChannelOpen(channel, knownPeerId, knownPeerName, !!isChat);
   channel.onmessage = e=> onChannelMsg(channel, e.data);
   channel.onclose = ()=> onChannelClose(channel);
@@ -733,9 +943,18 @@ function bindChannel(channel, pc, knownPeerId, knownPeerName, isChat){
       }
     };
   }
+  // 免交换码恢复时通道在绑定前可能已 open（onopen 不会再触发），需手动补一次 open 流程
+  if(channel.readyState==='open'){
+    setTimeout(()=>{
+      if(channelMap.get(channel)===info && channel.readyState==='open') onChannelOpen(channel, knownPeerId, knownPeerName, !!isChat);
+    },0);
+  }
 }
 
 function onChannelOpen(channel, peerId, peerName, isChat){
+  const channelInfo = channelMap.get(channel);
+  if(!channelInfo || channelInfo.opened) return;
+  channelInfo.opened = true;
   if(!isChat){
     // file 通道打开：如果 chat 已登记，将 file 通道补连到 connections
     const info = channelMap.get(channel);
@@ -743,9 +962,10 @@ function onChannelOpen(channel, peerId, peerName, isChat){
     for(const [ch, inf] of channelMap){
       if(inf.pc===info.pc && inf.isChat && inf.contactId){
         const conn = connections.get(inf.contactId);
-        if(conn && !conn.file){
-          conn.file = channel;
+        if(conn && conn.pc===info.pc){ // 忽略已被新连接替换的旧 PC 上的通道
           info.contactId = inf.contactId;
+          if(!conn.file) conn.file = channel;
+          replayPendingMediaMeta(info.pc, inf.contactId, channel);
         }
         break;
       }
@@ -767,80 +987,111 @@ function onChannelMsg(channel, data){
   // v2.10.2 起 meta/分块/end 全走同一 file 通道（同一 SCTP ordered stream），incoming 状态挂在本通道条目上；
   // 为兼容旧版对端（meta 仍走 chat 通道），本条目无 incoming 状态时回溯同 PC 的 chat 条目查找
   if(typeof data !== 'string'){
-    let target = channelMap.get(channel);
-    if(target && !target.incomingFile && !target.incomingImage && !target.incomingVideo && !target.incomingAudio){
-      for(const [ch, inf] of channelMap){
-        if(inf.pc===target.pc && inf.isChat && inf.contactId===target.contactId){
-          target = inf; break;
-        }
+    const chInfo = channelMap.get(channel);
+    if(!chInfo) return;
+    const len = data && typeof data.byteLength==='number' ? data.byteLength : 0;
+    if(len<=0) return;
+    const pc = chInfo.pc;
+    // 查找同一 PC 上正在接收的媒体状态；新对端挂 file 条目，旧对端 meta 走 chat 时挂 chat 条目
+    let target=null, def=null;
+    for(const inf of channelMap.values()){
+      if(inf.pc!==pc) continue;
+      for(const kind of ['file','image','video','audio']){
+        const d=transferDef(kind);
+        if(inf[d.inc]){ target=inf; def=d; break; }
       }
+      if(target) break;
     }
-    if(target && target.incomingFile){
-      target.incomingFile.chunks.push(data);
-      target.incomingFile.received += data.byteLength;
-      const stf=fileTransfers.get(target.incomingFile.fid); if(stf) stf.received=target.incomingFile.received;
-      updateFileProgress(target.incomingFile.fid);
-    }else if(target && target.incomingImage){
-      target.incomingImage.chunks.push(data);
-      target.incomingImage.received += data.byteLength;
-      const sti=imageTransfers.get(target.incomingImage.iid); if(sti) sti.received=target.incomingImage.received;
-      updateImageProgress(target.incomingImage.iid);
-    }else if(target && target.incomingVideo){
-      target.incomingVideo.chunks.push(data);
-      target.incomingVideo.received += data.byteLength;
-      const stv=videoTransfers.get(target.incomingVideo.vid); if(stv) stv.received=target.incomingVideo.received;
-      updateVideoProgress(target.incomingVideo.vid);
-    }else if(target && target.incomingAudio){
-      target.incomingAudio.chunks.push(data);
-      target.incomingAudio.received += data.byteLength;
-      const sta=audioTransfers.get(target.incomingAudio.aid); if(sta) sta.received=target.incomingAudio.received;
-      updateAudioProgress(target.incomingAudio.aid);
+    if(!target){ bufferEarlyChunk(pc, data); return; } // 旧对端 meta 可能还在 chat 通道排队
+    if(target.contactId){
+      const active=connections.get(target.contactId);
+      if(!active || active.pc!==pc) return; // 已被替换的旧连接
     }
+    const inc=target[def.inc];
+    const remain=inc.size-inc.received;
+    if(remain<=0){
+      if(inc.endPending) def.finish(target.contactId, target, inc[def.idKey]);
+      return;
+    }
+    const part = len>remain ? data.slice(0,remain) : data;
+    if(!inc.unsafe) inc.chunks.push(part);
+    inc.received += Math.min(len, remain);
+    const st=def.progress.get(inc[def.idKey]); if(st) st.received=inc.received;
+    def.update(inc[def.idKey]);
+    // meta/end 同通道时收满即可完成；旧对端 end 走 chat 先到时也由这里兜底完成
+    if(inc.received>=inc.size) def.finish(target.contactId, target, inc[def.idKey]);
     return;
   }
   let m; try{ m=JSON.parse(data); }catch{ return; }
   if(m.type==='hello'){
+    if(!m.identity || !isSafePeerId(m.identity.id)) return;
+    const peerName = normalizeName(m.identity.name);
     const info=channelMap.get(channel);
+    if(!info || !info.isChat) return; // hello 仅允许通过 chat 通道交换身份
     // 已连接的同联系人发来 hello（改名同步）：仅更新用户名，不重走连接流程
     if(info && info.contactId && info.contactId===m.identity.id && connections.has(info.contactId)){
       const c=getContact(info.contactId);
-      if(c){ c.peerName=m.identity.name||c.peerName; c.lastSeen=nowTs(); saveStore(); renderContacts(); if(info.contactId===currentId) renderTopbar(); }
+      if(c){ if(peerName) c.peerName=peerName; c.lastSeen=nowTs(); saveStore(); renderContacts(); if(info.contactId===currentId) renderTopbar(); }
       return;
     }
-    finalizeChannels(channel, m.identity.id, m.identity.name);
+    finalizeChannels(channel, m.identity.id, peerName);
     return;
   }
   const info = channelMap.get(channel);
   const cId = info && info.contactId;
-  if(!cId) return; // 身份未确认前丢弃业务消息
+  if(!cId){
+    // 新版 meta 走 file 通道，可能先于 chat hello 的身份登记到达；暂存待 finalize 后补处理
+    if(info && !info.isChat && ['file-meta','image-meta','video-meta','audio-meta'].includes(m.type)){
+      pendingMediaMetaByPc.set(info.pc, {m, channel});
+    }else if(info && !info.isChat && m.type==='transfer-abort'){
+      pendingMediaMetaByPc.delete(info.pc); earlyChunksByPc.delete(info.pc);
+    }
+    return; // 身份未确认前丢弃业务消息
+  }
+  // 只处理当前连接的数据，忽略被替换的旧通道（重复建连/恢复后残留）
+  const activeConn = connections.get(cId);
+  if(!activeConn || activeConn.pc!==info.pc) return;
   if(m.type==='msg'){
-    const conn = connections.get(cId);
+    const conn = activeConn;
+    const seq = (typeof m.seq==='number' && isFinite(m.seq) && m.seq>=0) ? m.seq : undefined;
+    m.seq = seq; // 非有限/负数序号视为旧版无 seq 消息
     // seq 去重：已处理过的消息只回累积 ACK，不重复 addMessage（弱网重传时）
-    if(conn && typeof m.seq==='number'){
-      if(m.seq < conn.inSeq){ sendAck(cId, conn.inSeq-1); return; }
-      conn.inSeq = Math.max(conn.inSeq, m.seq+1);
+    if(seq!==undefined){
+      if(seq < conn.inSeq){
+        if(conn.gotMsg){ sendAck(cId, conn.inSeq-1); return; }
+        // 本次连接首条消息低于历史基线：对端清空记录/导入旧备份导致序号回退，重建接收基线
+        conn.inSeq = 0;
+      }
+      conn.gotMsg = true;
+      conn.inSeq = Math.max(conn.inSeq, seq+1);
       sendAck(cId, conn.inSeq-1);
     }
-    addMessage(cId, 'in', m.text, m.ts, m.seq);
+    const text = typeof m.text==='string' ? m.text : (m.text==null ? '' : String(m.text));
+    const ts = (typeof m.ts==='number' && isFinite(m.ts)) ? m.ts : nowTs();
+    addMessage(cId, 'in', text, ts, seq);
     if(cId===currentId) sendReadReceipt(cId);
   }
   else if(m.type==='file-meta'){ startReceiveFile(cId, info, m); if(cId===currentId) sendReadReceipt(cId); }
-  else if(m.type==='file-end'){ finishReceiveFile(cId, info, m.fid); }
+  else if(m.type==='file-end'){ if(isSafeTransferId(m.fid)) finishReceiveFile(cId, info, m.fid); }
   else if(m.type==='image-meta'){ startReceiveImage(cId, info, m); if(cId===currentId) sendReadReceipt(cId); }
-  else if(m.type==='image-end'){ finishReceiveImage(cId, info, m.iid); }
+  else if(m.type==='image-end'){ if(isSafeTransferId(m.iid)) finishReceiveImage(cId, info, m.iid); }
   else if(m.type==='video-meta'){ startReceiveVideo(cId, info, m); if(cId===currentId) sendReadReceipt(cId); }
-  else if(m.type==='video-end'){ finishReceiveVideo(cId, info, m.vid); }
+  else if(m.type==='video-end'){ if(isSafeTransferId(m.vid)) finishReceiveVideo(cId, info, m.vid); }
   else if(m.type==='audio-meta'){ startReceiveAudio(cId, info, m); if(cId===currentId) sendReadReceipt(cId); }
-  else if(m.type==='audio-end'){ finishReceiveAudio(cId, info, m.aid); }
+  else if(m.type==='audio-end'){ if(isSafeTransferId(m.aid)) finishReceiveAudio(cId, info, m.aid); }
+  else if(m.type==='transfer-abort'){
+    if(['file','image','video','audio'].includes(m.kind) && isSafeTransferId(m.id)) abortIncomingTransfer(m.kind, cId, info, m.id, true);
+  }
   else if(m.type==='read'){
     const c = getContact(cId);
     if(c){
-      if(typeof m.seq==='number') c.peerReadSeq = Math.max(c.peerReadSeq||0, m.seq);
-      c.peerReadTs = m.ts; // 保留时间戳用于文件/图片消息回退
+      if(typeof m.seq==='number' && isFinite(m.seq)) c.peerReadSeq = Math.max(c.peerReadSeq||0, m.seq);
+      if(typeof m.ts==='number' && isFinite(m.ts)) c.peerReadTs = m.ts; // 保留时间戳用于文件/图片消息回退
       saveStoreDebounced(); if(cId===currentId) requestAnimationFrame(()=>refreshMessageReadStatus(cId));
     }
   }
   else if(m.type==='ack'){
+    if(typeof m.seq!=='number' || !isFinite(m.seq)) return;
     const conn = connections.get(cId);
     if(conn){
       for(const [seq, p] of conn.pending){
@@ -849,12 +1100,13 @@ function onChannelMsg(channel, data){
     }
     const c = getContact(cId);
     if(c){
-      c.peerDeliveredSeq = Math.max(c.peerDeliveredSeq||0, m.seq);
-      c.peerDeliveredTs = nowTs(); // 保留时间戳用于文件/图片消息回退
+      c.peerDeliveredSeq = Math.max(typeof c.peerDeliveredSeq==='number'?c.peerDeliveredSeq:0, m.seq);
+      // 不在此刷新 peerDeliveredTs：文字 ACK 的时间不能证明此前文件/图片/视频/语音已送达
       saveStoreDebounced(); if(cId===currentId) requestAnimationFrame(()=>refreshMessageReadStatus(cId));
     }
   }
   else if(m.type==='delivered'){
+    if(typeof m.ts!=='number' || !isFinite(m.ts)) return;
     const c = getContact(cId);
     if(c && (!c.peerDeliveredTs || m.ts > c.peerDeliveredTs)){
       c.peerDeliveredTs = m.ts; saveStoreDebounced(); if(cId===currentId) requestAnimationFrame(()=>refreshMessageReadStatus(cId));
@@ -868,7 +1120,7 @@ function onChannelMsg(channel, data){
   else if(m.type==='pong'){ /* 心跳回应：连接存活，无需处理 */ }
   // 收到消息发已送达回执（msg 已通过 ACK 覆盖，此处仅对无 seq 消息和 file-meta 等发 delivered）
   // v2.13.6：排除 bye——对端主动断开通知无需回执（旧版会对 bye 多回一条 delivered）
-  if(m.type!=='delivered' && m.type!=='read' && m.type!=='ack' && m.type!=='ping' && m.type!=='pong' && m.type!=='bye'){
+  if(m.type!=='delivered' && m.type!=='read' && m.type!=='ack' && m.type!=='ping' && m.type!=='pong' && m.type!=='bye' && m.type!=='transfer-abort'){
     // 仅非 msg 或旧版无 seq 的 msg 发 delivered（新版 msg 走 ACK）
     if(m.type!=='msg' || typeof m.seq!=='number') sendDeliveredReceipt(cId);
   }
@@ -891,6 +1143,7 @@ function stopHeartbeat(conn){
   if(conn && conn.hbTimer){ clearInterval(conn.hbTimer); conn.hbTimer=null; }
 }
 function finalizeChannels(chatCh, peerId, peerName){
+  if(!isSafePeerId(peerId)) return;
   const chatInfo = channelMap.get(chatCh);
   if(!chatInfo) return;
   const pc = chatInfo.pc;
@@ -902,7 +1155,7 @@ function finalizeChannels(chatCh, peerId, peerName){
   const oldId = chatInfo.contactId;
   if(oldId && oldId!==peerId){
     const oc = connections.get(oldId);
-    if(oc){ for(const [seq,p] of oc.pending) clearTimeout(p.timer); oc.pending.clear(); }
+    if(oc){ stopHeartbeat(oc); for(const [seq,p] of oc.pending) clearTimeout(p.timer); oc.pending.clear(); }
     connections.delete(oldId);
   }
   // 在 channelMap 中对两个通道写入 contactId
@@ -922,12 +1175,27 @@ function finalizeChannels(chatCh, peerId, peerName){
   // v2.13.5：清空聊天记录后历史为空，但联系人的 peerReadSeq/peerDeliveredSeq 仍持久化保留；
   // outSeq 若归零，新发出 seq 0 <= 旧 peerReadSeq 会被误标「已读」。以持久化回执序号为下界兜底
   // （peerReadSeq 即对端已读过的本方消息上界，新 seq 必须大于它）。
-  maxOutSeq = Math.max(maxOutSeq, c.peerReadSeq||-1, c.peerDeliveredSeq||-1);
-  // v2.13.5：同 id 旧连接残留（半开：chat 已断 file 未断时会被本次覆盖）——先停心跳/清重传定时器，
-  // 防旧 hbTimer interval 泄漏累积（每次半断重连叠一个，且旧 interval 会 ping 到新连接上造成双发）
+  const peerReadSeq = typeof c.peerReadSeq==='number' ? c.peerReadSeq : -1;
+  const peerDeliveredSeq = typeof c.peerDeliveredSeq==='number' ? c.peerDeliveredSeq : -1;
+  maxOutSeq = Math.max(maxOutSeq, peerReadSeq, peerDeliveredSeq);
+  const outSeq = Math.max(maxOutSeq+1, c.outSeqNext||0);
+  c.outSeqNext = outSeq;
+  // 同 id 旧连接残留（半开：chat 已断 file 未断时会被本次覆盖）——先停心跳/清重传定时器，
+  // 关闭旧通道/PC，防旧 interval 泄漏和旧通道继续收发
   const prevConn = connections.get(peerId);
-  if(prevConn){ stopHeartbeat(prevConn); for(const [s2,p2] of prevConn.pending) clearTimeout(p2.timer); prevConn.pending.clear(); }
-  connections.set(peerId, {chat: chatCh, file: fileCh, pc, outSeq: maxOutSeq+1, inSeq: maxInSeq+1, pending:new Map()});
+  if(prevConn){
+    stopHeartbeat(prevConn);
+    for(const [s2,p2] of prevConn.pending) clearTimeout(p2.timer);
+    prevConn.pending.clear();
+    try{ if(prevConn.chat && prevConn.chat!==chatCh) prevConn.chat.close(); }catch(e){}
+    try{ if(prevConn.file && prevConn.file!==fileCh) prevConn.file.close(); }catch(e){}
+    if(prevConn.pc !== pc){
+      try{ prevConn.pc.close(); }catch(e){}
+      earlyChunksByPc.delete(prevConn.pc);
+      pendingMediaMetaByPc.delete(prevConn.pc);
+    }
+  }
+  connections.set(peerId, {chat: chatCh, file: fileCh, pc, outSeq, inSeq: maxInSeq+1, pending:new Map(), gotMsg:false});
   revivable.delete(peerId); peerBye.delete(peerId); cancelAutoRevive(peerId);
   autoReviveRetries.delete(peerId); // 连接成功，清零自动恢复重试计数
   if(pendingPC===pc) pendingPC=null;
@@ -940,11 +1208,13 @@ function finalizeChannels(chatCh, peerId, peerName){
   closeDialog('dlgConnect');
   closeDialog('dlgQr');       // 连接成功自动关闭二维码展示弹窗（应答码/邀请码）
   closeDialog('dlgQrLarge');
+  try{ closeScanner(); }catch(e){} // 连接成功后释放可能仍在运行的摄像头
   // 首次连接：记录 lastReadTs 作为分界线基准。重连时保留旧值，
   // 确保对方离线消息到达后 m.ts > lastReadTs 能正确触发分界线
   const hadLastRead = !!c.lastReadTs;
   selectContact(peerId, hadLastRead);
   if(!hadLastRead) c.lastReadTs = nowTs();
+  replayPendingMediaMeta(pc, peerId, fileCh); // 处理身份登记前到达的 file 通道媒体 meta
   // v2.13.5：无条件提示——旧版仅邀请方显示（被邀方 bindChannel 时已带 contactId，oldId 恒真被跳过），双方不对称
   appendSys(peerId, "✅ 已建立加密直连");
   toast("已连接 "+contactDisplayText(c));
@@ -961,9 +1231,10 @@ function onChannelClose(channel){
   const cId = info.contactId;
   const pc = info.pc;
   channelMap.delete(channel);
-  if(!cId) return;
+  if(!cId){ pendingMediaMetaByPc.delete(pc); earlyChunksByPc.delete(pc); return; }
   const conn = connections.get(cId);
   if(!conn) return;
+  const activeChannel = info.isChat ? conn.chat===channel : conn.file===channel;
   // 断开当前通道
   if(info.isChat && conn.chat===channel){
     conn.chat = null;
@@ -971,6 +1242,18 @@ function onChannelClose(channel){
     stopHeartbeat(conn);
   }
   else if(!info.isChat && conn.file===channel) conn.file = null;
+  // 只中止当前连接上的媒体传输；重复建连残留的旧通道关闭不影响新连接
+  if(activeChannel){
+    abortAllIncoming(cId, info);
+    if(!info.isChat){
+      earlyChunksByPc.delete(pc);
+      for(const inf of channelMap.values()){
+        if(inf.pc===pc) abortAllIncoming(inf.contactId || cId, inf);
+      }
+    }else{
+      earlyChunksByPc.delete(pc);
+    }
+  }
   // 两个通道都断开才算真正断开
   if(!conn.chat && !conn.file){
     // 清理 pending 定时器与心跳
@@ -1001,6 +1284,7 @@ function scheduleAutoRevive(cId, immediate){
   const t = setTimeout(async ()=>{
     autoReviveTimers.delete(cId);
     if(connections.has(cId)) return; // 已恢复或已重连
+    if(peerBye.has(cId)) return; // 对端已主动断开，不再自动恢复
     if(!revivable.has(cId)) return;
     const pc = revivable.get(cId);
     const st = pc.iceConnectionState;
@@ -1034,6 +1318,8 @@ function cleanupPending(){
   if(pendingPC){
     // 清理 pendingPC 上的所有通道
     for(const [ch,info] of channelMap){ if(info.pc===pendingPC){ try{ch.close();}catch(e){} channelMap.delete(ch); } }
+    earlyChunksByPc.delete(pendingPC);
+    pendingMediaMetaByPc.delete(pendingPC);
     try{ pendingPC.close(); }catch(e){}
     pendingPC=null;
   }
@@ -1042,6 +1328,9 @@ function cleanupPending(){
 async function detectPeerIp(pc, contactId){
   try{
     await new Promise(r=>setTimeout(r,500));
+    // 连接已被新连接替换时不要用旧连接的统计覆盖联系人信息
+    const active=connections.get(contactId);
+    if(active && active.pc!==pc) return;
     const stats = await pc.getStats();
     let ip="", ctype="";
     stats.forEach(r=>{
@@ -1070,7 +1359,7 @@ function ipModeLabel(ctype){
   if(ctype==='host'||ctype==='prflx') return '直连';
   if(ctype==='srflx') return 'STUN';
   if(ctype==='signal') return '信令';
-  return ctype||'';
+  return ''; // 忽略未知/导入的任意值，避免被当作 HTML 插入
 }
 
 /* ===================== 已读回执 / ACK ===================== */
@@ -1100,10 +1389,10 @@ function retransmitMsg(cId, seq){
   const p = conn.pending.get(seq);
   if(!p) return; // 已被 ACK 确认
   p.retries++;
-  // 先判断是否已达上限（3次），避免多设一轮 24s 定时器导致延迟 45s 才报失败
+  // 首发 + 2 次重传（3s、9s），21s 的第三次定时器触发时仍未确认则判定失败
   if(p.retries >= 3){
     conn.pending.delete(seq);
-    if(cId===currentId) appendSys(cId, "⚠ 消息发送失败（已重试3次）");
+    if(cId===currentId) appendSys(cId, "⚠ 消息发送失败（对端未确认）");
     return;
   }
   try{ conn.chat.send(JSON.stringify({type:"msg", ts:p.ts, text:p.text, seq})); }catch(e){}
@@ -1129,6 +1418,15 @@ function refreshMessageReadStatus(contactId){
   });
 }
 
+/* 分配出站 seq，并把下一条序号持久化到 contact：
+   清空聊天记录后历史为空，若不持久化 outSeqNext，重连后序号会从 0 重来，
+   被对端按旧 inSeq 当成重复消息丢弃，或被旧 peerReadSeq 误标为已读。 */
+function allocOutSeq(contactId, conn){
+  const seq = conn.outSeq++;
+  const c = getContact(contactId);
+  if(c) c.outSeqNext = Math.max(typeof c.outSeqNext==='number'?c.outSeqNext:0, conn.outSeq);
+  return seq;
+}
 /* 发送消息 */
 function sendMsg(){
   const ta=document.getElementById('inputMsg');
@@ -1147,7 +1445,7 @@ function sendMsg(){
   // 在线：正常发送
   if(conn.chat.bufferedAmount > 64*1024) return toast("网络拥塞，稍后重试");
   const ts=nowTs();
-  const seq = conn.outSeq++;
+  const seq = allocOutSeq(cId, conn);
   const msg = {type:"msg", ts, text, seq};
   try{ conn.chat.send(JSON.stringify(msg)); }catch(e){ return toast("发送失败: "+e.message); }
   // 加入重传队列（3s 后若未收到 ACK 则重发）
@@ -1159,6 +1457,7 @@ function sendMsg(){
 function addPendingMessage(contactId, dir, text, ts){
   if(!store.messages[contactId]) store.messages[contactId]=[];
   store.messages[contactId].push({ts, dir, text, pending:true});
+  const c=getContact(contactId); if(c) c.lastSeen=nowTs();
   saveStore();
   if(contactId===currentId) renderMessages(true); // v2.13.6：自己发的离线消息强制滚到底
   renderContacts();
@@ -1168,19 +1467,19 @@ function flushPendingMessages(contactId){
   const conn = connections.get(contactId);
   if(!conn || !conn.chat) return;
   const arr = store.messages[contactId]||[];
-  let flushed = false;
+  let sent = 0;
   for(const m of arr){
     if(m.pending && m.dir==='out'){
-      flushed = true;
-      const seq = conn.outSeq++;
+      const seq = allocOutSeq(contactId, conn);
       try{ conn.chat.send(JSON.stringify({type:"msg", ts:m.ts, text:m.text, seq})); }catch(e){ continue; }
       const timer = setTimeout(()=>retransmitMsg(contactId, seq), 3000);
       conn.pending.set(seq, {text:m.text, ts:m.ts, timer, retries:0});
       m.seq = seq; // 持久化 seq，用于精确回执判断
       delete m.pending;
+      sent++;
     }
   }
-  if(flushed){
+  if(sent){
     saveStore();
     if(contactId===currentId) renderMessages(true); // v2.13.6：批量补发后强制滚到底
     appendSys(contactId, "↻ 已自动发送离线消息");
@@ -1191,7 +1490,11 @@ function addMessage(contactId, dir, text, ts, seq){
   if(typeof seq==='number') item.seq = seq;
   if(!store.messages[contactId]) store.messages[contactId]=[];
   store.messages[contactId].push(item);
-  const c=getContact(contactId); if(c) c.lastSeen=ts||nowTs();
+  const c=getContact(contactId);
+  if(c){
+    const t = dir==='in' ? nowTs() : (ts||nowTs());
+    if(!(c.lastSeen>=t)) c.lastSeen=t; // 补发旧消息不把最近联系时间改早
+  }
   if(dir==='in' && contactId!==currentId){ store.unread[contactId]=(store.unread[contactId]||0)+1; }
   saveStoreDebounced();
   if(contactId===currentId) renderMessages(dir==='out'); // v2.13.6：自己发的消息强制滚到底，收到的按 nearBottom
@@ -1237,6 +1540,95 @@ function acquireFileLock(){
 }
 const fileTransfers = new Map();       // fid -> {received,size,dir,contactId,name} 进度（出/入共用）
 const fileUrls = new Map();            // fid -> objectURL（运行时下载链接，不持久化）
+const failedTransfers = new Set();     // fid/iid/vid/aid：传输失败标记（运行时，用于卡片显示）
+/* 旧版对端 meta/end 走 chat、分块走 file，两个 SCTP 流之间没有顺序保证；在 meta 到达前
+   先按 PC 暂存 file 通道分块，meta 到达后并入对应传输。新版 meta/end 同 file 通道时通常为空。 */
+const EARLY_CHUNK_LIMIT = 32*1024*1024;
+const earlyChunksByPc = new Map();     // pc -> {chunks:[], bytes}
+const pendingMediaMetaByPc = new Map(); // pc -> media meta（file 通道 meta 先于 chat hello/身份登记到达时暂存）
+
+/* 媒体传输种类定义：接收状态字段、进度表、卡片重绘函数等 */
+function transferDef(kind){
+  if(kind==='file') return { inc:'incomingFile', idKey:'fid', progress:fileTransfers, update:updateFileProgress, finish:finishReceiveFile, label:'文件' };
+  if(kind==='image') return { inc:'incomingImage', idKey:'iid', progress:imageTransfers, update:updateImageProgress, finish:finishReceiveImage, label:'图片' };
+  if(kind==='video') return { inc:'incomingVideo', idKey:'vid', progress:videoTransfers, update:updateVideoProgress, finish:finishReceiveVideo, label:'视频' };
+  if(kind==='audio') return { inc:'incomingAudio', idKey:'aid', progress:audioTransfers, update:updateAudioProgress, finish:finishReceiveAudio, label:'语音' };
+  return null;
+}
+function bufferEarlyChunk(pc, data){
+  if(!pc || !data || typeof data.byteLength!=='number' || data.byteLength<=0) return;
+  let st=earlyChunksByPc.get(pc);
+  if(!st){ st={chunks:[],bytes:0}; earlyChunksByPc.set(pc, st); }
+  if(st.bytes + data.byteLength > EARLY_CHUNK_LIMIT){ st.chunks=[]; st.bytes=0; return; }
+  st.chunks.push(data); st.bytes += data.byteLength;
+}
+function applyEarlyChunks(info, inc, def){
+  const st=info && earlyChunksByPc.get(info.pc);
+  if(st) earlyChunksByPc.delete(info.pc);
+  if(!st || !st.chunks.length) return;
+  for(const part of st.chunks){
+    const remain=inc.size-inc.received;
+    if(remain<=0) break;
+    const take = part.byteLength>remain ? part.slice(0,remain) : part;
+    if(!inc.unsafe) inc.chunks.push(take);
+    inc.received += Math.min(part.byteLength, remain);
+  }
+  const stp=def.progress.get(inc[def.idKey]); if(stp) stp.received=inc.received;
+  def.update(inc[def.idKey]);
+}
+function abortIncomingTransfer(kind, cId, info, id, notify){
+  const def=transferDef(kind);
+  if(!def || !info) return;
+  const inc=info[def.inc];
+  if(!inc) return;
+  const got=inc[def.idKey];
+  if(id && got!==id) return;
+  info[def.inc]=null;
+  def.progress.delete(got);
+  failedTransfers.add(got);
+  if(notify) appendSys(cId, `⚠ ${def.label}传输已中止`);
+  if(cId===currentId) renderMessages();
+}
+function abortAllIncoming(cId, info){
+  if(!info) return;
+  ['file','image','video','audio'].forEach(kind=>abortIncomingTransfer(kind,cId,info,null,false));
+}
+function abortIncomingOnPc(pc, cId){
+  for(const info of channelMap.values()){
+    if(info.pc===pc) abortAllIncoming(cId || info.contactId, info);
+  }
+}
+function abortIncomingForContact(contactId){
+  for(const info of channelMap.values()){
+    if(info.contactId===contactId){
+      abortAllIncoming(contactId, info);
+      earlyChunksByPc.delete(info.pc);
+    }
+  }
+}
+function sendMediaAbort(channel, kind, id){
+  try{ if(channel && channel.readyState==='open') channel.send(JSON.stringify({type:"transfer-abort", kind, id})); }catch(e){}
+}
+/* file 通道的 meta 可能先于 chat 通道的 hello/身份登记到达；身份确认后补处理 */
+function replayPendingMediaMeta(pc, cId, fileCh){
+  const rec=pendingMediaMetaByPc.get(pc);
+  if(!rec) return;
+  pendingMediaMetaByPc.delete(pc);
+  const m=rec.m;
+  let info=rec.channel ? channelMap.get(rec.channel) : null;
+  if(!info) info=fileCh ? channelMap.get(fileCh) : null;
+  if(!info || info.isChat){
+    info=null;
+    for(const inf of channelMap.values()){ if(inf.pc===pc && !inf.isChat){ info=inf; break; } }
+  }
+  if(!info) return;
+  if(m.type==='file-meta') startReceiveFile(cId, info, m);
+  else if(m.type==='image-meta') startReceiveImage(cId, info, m);
+  else if(m.type==='video-meta') startReceiveVideo(cId, info, m);
+  else if(m.type==='audio-meta') startReceiveAudio(cId, info, m);
+  sendDeliveredReceipt(cId); // 补发该 meta 的送达回执（原处理路径因身份未登记而提前返回）
+  if(cId===currentId) sendReadReceipt(cId);
+}
 
 function pickFile(){ document.getElementById('fileSendInput').click(); }
 /* 附件菜单：聚合 拍照/图片/视频/录像/文件 到「＋」按钮 */
@@ -1361,18 +1753,22 @@ async function sendFile(file){
   const channel=conn.file;
   if(!channel.bufferedAmountLowThreshold || channel.bufferedAmountLowThreshold<1*1024*1024) channel.bufferedAmountLowThreshold=1*1024*1024;
   const fid=randId();
-  const meta={type:"file-meta", fid, name:file.name, size:file.size, mime:file.type||'application/octet-stream'};
+  const name=safeMetaName(file.name,'file');
+  const meta={type:"file-meta", fid, name, size:file.size, mime:file.type||'application/octet-stream'};
   /* meta / 分块 / end 全部走同一 file 通道（同一 SCTP ordered stream），确保 end 严格在所有分块
      之后到达。旧版 meta/end 走 chat 通道，公网高延迟下 chat 通道的 end 会先于 file 通道尾部分块
      到达，导致接收方用不完整 chunks 拼 Blob，文件残缺。串行锁防止并发传输分块交错。 */
   const release = await acquireFileLock();
+  let ok=false;
   try{
     try{ channel.send(JSON.stringify(meta)); }catch(e){ return toast("发送失败: "+e.message); }
-    fileTransfers.set(fid,{received:0,size:file.size,dir:'out',contactId:cId,name:file.name});
+    fileTransfers.set(fid,{received:0,size:file.size,dir:'out',contactId:cId,name});
+    failedTransfers.delete(fid);
     addFileMessage(cId,'out',meta);
     let offset=0;
     while(offset<file.size && channel.readyState==='open'){
       const buf=await file.slice(offset, offset+FILE_CHUNK).arrayBuffer();
+      if(!buf || !buf.byteLength) break; // 文件被截断/读取异常，避免死循环
       // 背压：缓冲过高时等 bufferedamountlow 事件（带超时 + 通道关闭检测）
       if(channel.bufferedAmount > FILE_BUF_HIGH){
         try{ await backpressureWait(channel, 30000); }catch(e){ toast("传输中断：网络拥塞超时"); break; }
@@ -1382,20 +1778,41 @@ async function sendFile(file){
       offset+=buf.byteLength;
       const st=fileTransfers.get(fid); if(st){ st.received=offset; updateFileProgress(fid); }
     }
-    if(offset>=file.size){ try{ channel.send(JSON.stringify({type:"file-end", fid})); }catch(e){} }
+    if(offset>=file.size){
+      try{ channel.send(JSON.stringify({type:"file-end", fid})); ok=true; }catch(e){}
+    }
   }catch(e){ toast("文件发送失败: "+e.message); }
-  finally{ fileTransfers.delete(fid); release(); }
+  finally{
+    fileTransfers.delete(fid);
+    if(!ok){ failedTransfers.add(fid); sendMediaAbort(channel,'file',fid); }
+    else failedTransfers.delete(fid);
+    release();
+  }
+  if(cId===currentId) renderMessages();
 }
 function startReceiveFile(cId, info, m){
-  info.incomingFile={fid:m.fid, name:m.name, size:m.size, mime:m.mime, received:0, chunks:[]};
-  fileTransfers.set(m.fid,{received:0,size:m.size,dir:'in',contactId:cId,name:m.name});
-  addFileMessage(cId,'in',m);
+  if(!info) return;
+  if(!isSafeTransferId(m.fid) || !isMetaSize(m.size)){ earlyChunksByPc.delete(info.pc); return; }
+  abortAllIncoming(cId, info); // 上一个未完成/异常残留的媒体传输先终止
+  const name=safeMetaName(m.name,'file');
+  const mime=safeMetaName(m.mime,'application/octet-stream');
+  const inc={fid:m.fid, name, size:m.size, mime, received:0, chunks:[], endPending:false};
+  info.incomingFile=inc;
+  fileTransfers.set(m.fid,{received:0,size:m.size,dir:'in',contactId:cId,name});
+  failedTransfers.delete(m.fid);
+  addFileMessage(cId,'in',{fid:m.fid,name,size:m.size});
+  applyEarlyChunks(info, inc, transferDef('file'));
+  if(inc.received>=inc.size) finishReceiveFile(cId, info, m.fid);
 }
 function finishReceiveFile(cId, info, fid){
-  const inc=info.incomingFile; info.incomingFile=null;
-  fileTransfers.delete(fid);
+  const inc=info && info.incomingFile;
   if(!inc || inc.fid!==fid) return;
-  const blob=new Blob(inc.chunks,{type:inc.mime||'application/octet-stream'});
+  if(inc.received < inc.size){ inc.endPending=true; return; }
+  info.incomingFile=null;
+  fileTransfers.delete(fid);
+  failedTransfers.delete(fid);
+  // 文件内容一律以 application/octet-stream 组装，避免对端声明 text/html 时打开 blob 链接执行脚本
+  const blob=new Blob(inc.chunks,{type:'application/octet-stream'});
   fileUrls.set(fid, URL.createObjectURL(blob));
   if(cId===currentId){
     const el=document.getElementById('file-'+fid);
@@ -1415,16 +1832,18 @@ function addFileMessage(contactId, dir, meta){
 function renderFileCardInto(el, f){
   const st=fileTransfers.get(f.fid);
   const url=fileUrls.get(f.fid);
-  const transferring=!!st;
+  const failed=failedTransfers.has(f.fid);
+  const transferring=!!st && !failed;
   const pct = st && st.size ? Math.min(100, Math.round(st.received/st.size*100)) : 0;
   let right='';
-  if(url){ right=`<a href="${url}" download="${escapeHtml(f.name)}">下载</a>`; }
+  if(failed){ right=`<span class="fs">${f.dir==='out'?'发送失败':'接收失败'}</span>`; }
+  else if(url){ right=`<a href="${url}" download="${escapeHtml(f.name)}">下载</a>`; }
   else if(f.dir==='out' && !transferring){ right=`<span class="fs">已发送</span>`; }
   else if(f.dir==='in' && !transferring){ right=`<span class="fs">（已失效）</span>`; }
   const info = transferring
-    ? `<div class="fs"><span class="fl-pct">${pct}%</span> · ${fmtSize(st.received)}/${fmtSize(f.size)}</div><div class="prog"><i style="width:${pct}%"></i></div>`
+    ? `<div class="fs"><span class="fl-pct">${pct}%</span> · <span class="fl-size">${fmtSize(st.received)}/${fmtSize(f.size)}</span></div><div class="prog"><i style="width:${pct}%"></i></div>`
     : `<div class="fs">${fmtSize(f.size)}</div>`;
-  const readTag = f.dir==='out' && f.ts ? `<span class="read-tag" data-ts="${f.ts}"></span>` : '';
+  const readTag = f.dir==='out' && f.ts ? `<span class="read-tag" data-ts="${escapeHtml(f.ts)}"></span>` : '';
   el.innerHTML=`<div class="file-card"><span class="fi">📎</span><div class="fc-info"><div class="fn">${escapeHtml(f.name)}</div>${info}</div><div>${right}${readTag}</div></div>`;
 }
 function updateFileProgress(fid){
@@ -1434,6 +1853,7 @@ function updateFileProgress(fid){
   const pct = st.size ? Math.min(100, Math.round(st.received/st.size*100)) : 100;
   const prog=el.querySelector('.prog>i'); if(prog) prog.style.width=pct+'%';
   const lp=el.querySelector('.fl-pct'); if(lp) lp.textContent=pct+'%';
+  const ls=el.querySelector('.fl-size'); if(ls) ls.textContent=`${fmtSize(st.received)}/${fmtSize(st.size)}`;
 }
 
 /* ===================== 图片传输（内嵌显示） ===================== */
@@ -1443,26 +1863,31 @@ const imageUrls = new Map();       // iid -> objectURL（运行时，不持久�
 function pickImage(){ document.getElementById('imageSendInput').click(); }
 function pickCamera(){ document.getElementById('cameraInput').click(); }
 async function sendImage(file){
-  if(!file.type.startsWith('image/')) return toast("请选择图片文件");
+  const mime=normalizeImageMime(file.type);
+  if(!mime) return toast("请选择 PNG/JPG/GIF/WebP 等图片文件");
   const cId=currentConnId();
   const conn = connections.get(cId);
   if(!conn || !conn.file || conn.file.readyState!=='open') return toast("未连接，无法发送图片");
   const channel=conn.file;
   if(!channel.bufferedAmountLowThreshold || channel.bufferedAmountLowThreshold<1*1024*1024) channel.bufferedAmountLowThreshold=1*1024*1024;
   const iid=randId();
-  const meta={type:"image-meta", iid, name:file.name, size:file.size, mime:file.type||'image/png'};
+  const name=safeMetaName(file.name,'image');
+  const meta={type:"image-meta", iid, name, size:file.size, mime};
   /* meta / 分块 / end 全部走同一 file 通道（同一 SCTP ordered stream），确保 end 不会抢先于
      分块到达——旧版 end 走 chat 通道，公网高延迟下会先于 file 通道尾部分块到达，接收方用不完整
      chunks 拼 Blob，图片出现顶部一条/灰色条带等残缺。串行锁防止并发传输分块交错。 */
   const release = await acquireFileLock();
+  let ok=false;
   try{
     try{ channel.send(JSON.stringify(meta)); }catch(e){ return toast("发送失败: "+e.message); }
-    imageTransfers.set(iid,{received:0,size:file.size,dir:'out',contactId:cId,name:file.name});
+    imageTransfers.set(iid,{received:0,size:file.size,dir:'out',contactId:cId,name});
     imageUrls.set(iid, URL.createObjectURL(file)); // 发送方立即显示缩略图
+    failedTransfers.delete(iid);
     addImageMessage(cId,'out',meta);
     let offset=0;
     while(offset<file.size && channel.readyState==='open'){
       const buf=await file.slice(offset, offset+FILE_CHUNK).arrayBuffer();
+      if(!buf || !buf.byteLength) break;
       if(channel.bufferedAmount > FILE_BUF_HIGH){
         try{ await backpressureWait(channel, 30000); }catch(e){ toast("传输中断：网络拥塞超时"); break; }
       }
@@ -1471,19 +1896,49 @@ async function sendImage(file){
       offset+=buf.byteLength;
       const st=imageTransfers.get(iid); if(st){ st.received=offset; updateImageProgress(iid); }
     }
-    if(offset>=file.size){ try{ channel.send(JSON.stringify({type:"image-end", iid})); }catch(e){} }
+    if(offset>=file.size){
+      try{ channel.send(JSON.stringify({type:"image-end", iid})); ok=true; }catch(e){}
+    }
   }catch(e){ toast("图片发送失败: "+e.message); }
-  finally{ imageTransfers.delete(iid); release(); }
+  finally{
+    imageTransfers.delete(iid);
+    if(!ok){ failedTransfers.add(iid); sendMediaAbort(channel,'image',iid); }
+    else failedTransfers.delete(iid);
+    release();
+  }
+  if(cId===currentId) renderMessages();
 }
 function startReceiveImage(cId, info, m){
-  info.incomingImage={iid:m.iid, name:m.name, size:m.size, mime:m.mime, received:0, chunks:[]};
-  imageTransfers.set(m.iid,{received:0,size:m.size,dir:'in',contactId:cId,name:m.name});
-  addImageMessage(cId,'in',m);
+  if(!info) return;
+  if(!isSafeTransferId(m.iid) || !isMetaSize(m.size)){ earlyChunksByPc.delete(info.pc); return; }
+  abortAllIncoming(cId, info);
+  const name=safeMetaName(m.name,'image');
+  const mime=safeMetaName(m.mime,'image/png');
+  const unsafe=!isSafeImageMime(mime);
+  const inc={iid:m.iid, name, size:m.size, mime, unsafe, received:0, chunks:[], endPending:false};
+  info.incomingImage=inc;
+  imageTransfers.set(m.iid,{received:0,size:m.size,dir:'in',contactId:cId,name});
+  failedTransfers.delete(m.iid);
+  addImageMessage(cId,'in',{iid:m.iid,name,size:m.size});
+  applyEarlyChunks(info, inc, transferDef('image'));
+  if(inc.received>=inc.size) finishReceiveImage(cId, info, m.iid);
 }
 function finishReceiveImage(cId, info, iid){
-  const inc=info.incomingImage; info.incomingImage=null;
-  imageTransfers.delete(iid);
+  const inc=info && info.incomingImage;
   if(!inc || inc.iid!==iid) return;
+  if(inc.received < inc.size){ inc.endPending=true; return; }
+  info.incomingImage=null;
+  imageTransfers.delete(iid);
+  if(inc.unsafe){
+    failedTransfers.add(iid);
+    appendSys(cId, "⚠ 已忽略不支持的图片格式（仅支持 PNG/JPG/GIF/WebP 等）");
+    if(cId===currentId){
+      const el=document.getElementById('img-'+iid);
+      if(el) renderImageInto(el,{iid,name:inc.name,size:inc.size,dir:'in'});
+    }
+    return;
+  }
+  failedTransfers.delete(iid);
   const blob=new Blob(inc.chunks,{type:inc.mime||'image/png'});
   imageUrls.set(iid, URL.createObjectURL(blob));
   if(cId===currentId){
@@ -1504,18 +1959,22 @@ function addImageMessage(contactId, dir, meta){
 function renderImageInto(el, img){
   const url=imageUrls.get(img.iid);
   const st=imageTransfers.get(img.iid);
-  const transferring=!!st;
+  const failed=failedTransfers.has(img.iid);
+  const transferring=!!st && !failed;
   let body='';
   if(url){
     body=`<img src="${url}" alt="${escapeHtml(img.name)}" onclick="openImageview(this.src)" title="点击查看原图">`;
   }else if(transferring){
     const pct = st && st.size ? Math.min(100, Math.round(st.received/st.size*100)) : 0;
     body=`<div class="img-expired"><div style="text-align:center"><span class="spinner" style="margin-right:6px"></span>${pct}%</div></div>`;
+  }else if(failed){
+    body=`<div class="img-expired">（图片传输失败 · ${fmtSize(img.size)}）</div>`;
   }else{
     body=`<div class="img-expired">（图片已失效 · ${fmtSize(img.size)}）</div>`;
   }
-  const readTag = img.dir==='out' && img.ts ? `<span class="read-tag" data-ts="${img.ts}"></span>` : '';
-  el.innerHTML=body+`<div class="img-info">${fmtTime(img.ts||nowTs())}${readTag}</div>`;
+  const readTag = img.dir==='out' && img.ts ? `<span class="read-tag" data-ts="${escapeHtml(img.ts)}"></span>` : '';
+  const state = failed ? ` · ${img.dir==='out'?'发送失败':'接收失败'}` : '';
+  el.innerHTML=body+`<div class="img-info">${fmtTime(img.ts||nowTs())}${state}${readTag}</div>`;
 }
 function updateImageProgress(iid){
   const st=imageTransfers.get(iid); if(!st) return;
@@ -1550,17 +2009,21 @@ async function sendVideo(file){
   const channel=conn.file;
   if(!channel.bufferedAmountLowThreshold || channel.bufferedAmountLowThreshold<1*1024*1024) channel.bufferedAmountLowThreshold=1*1024*1024;
   const vid=randId();
-  const meta={type:"video-meta", vid, name:file.name, size:file.size, mime:file.type||'video/mp4'};
+  const name=safeMetaName(file.name,'video');
+  const meta={type:"video-meta", vid, name, size:file.size, mime:file.type||'video/mp4'};
   /* meta/分块/end 全走同一 file 通道（同 image），串行锁防并发分块交错 */
   const release = await acquireFileLock();
+  let ok=false;
   try{
     try{ channel.send(JSON.stringify(meta)); }catch(e){ return toast("发送失败: "+e.message); }
-    videoTransfers.set(vid,{received:0,size:file.size,dir:'out',contactId:cId,name:file.name});
+    videoTransfers.set(vid,{received:0,size:file.size,dir:'out',contactId:cId,name});
     videoUrls.set(vid, URL.createObjectURL(file)); // 发送方立即显示
+    failedTransfers.delete(vid);
     addVideoMessage(cId,'out',meta);
     let offset=0;
     while(offset<file.size && channel.readyState==='open'){
       const buf=await file.slice(offset, offset+FILE_CHUNK).arrayBuffer();
+      if(!buf || !buf.byteLength) break;
       if(channel.bufferedAmount > FILE_BUF_HIGH){
         try{ await backpressureWait(channel, 30000); }catch(e){ toast("传输中断：网络拥塞超时"); break; }
       }
@@ -1569,19 +2032,39 @@ async function sendVideo(file){
       offset+=buf.byteLength;
       const st=videoTransfers.get(vid); if(st){ st.received=offset; updateVideoProgress(vid); }
     }
-    if(offset>=file.size){ try{ channel.send(JSON.stringify({type:"video-end", vid})); }catch(e){} }
+    if(offset>=file.size){
+      try{ channel.send(JSON.stringify({type:"video-end", vid})); ok=true; }catch(e){}
+    }
   }catch(e){ toast("视频发送失败: "+e.message); }
-  finally{ videoTransfers.delete(vid); release(); }
+  finally{
+    videoTransfers.delete(vid);
+    if(!ok){ failedTransfers.add(vid); sendMediaAbort(channel,'video',vid); }
+    else failedTransfers.delete(vid);
+    release();
+  }
+  if(cId===currentId) renderMessages();
 }
 function startReceiveVideo(cId, info, m){
-  info.incomingVideo={vid:m.vid, name:m.name, size:m.size, mime:m.mime, received:0, chunks:[]};
-  videoTransfers.set(m.vid,{received:0,size:m.size,dir:'in',contactId:cId,name:m.name});
-  addVideoMessage(cId,'in',m);
+  if(!info) return;
+  if(!isSafeTransferId(m.vid) || !isMetaSize(m.size)){ earlyChunksByPc.delete(info.pc); return; }
+  abortAllIncoming(cId, info);
+  const name=safeMetaName(m.name,'video');
+  const mime=safeMetaName(m.mime,'video/mp4');
+  const inc={vid:m.vid, name, size:m.size, mime, received:0, chunks:[], endPending:false};
+  info.incomingVideo=inc;
+  videoTransfers.set(m.vid,{received:0,size:m.size,dir:'in',contactId:cId,name});
+  failedTransfers.delete(m.vid);
+  addVideoMessage(cId,'in',{vid:m.vid,name,size:m.size});
+  applyEarlyChunks(info, inc, transferDef('video'));
+  if(inc.received>=inc.size) finishReceiveVideo(cId, info, m.vid);
 }
 function finishReceiveVideo(cId, info, vid){
-  const inc=info.incomingVideo; info.incomingVideo=null;
-  videoTransfers.delete(vid);
+  const inc=info && info.incomingVideo;
   if(!inc || inc.vid!==vid) return;
+  if(inc.received < inc.size){ inc.endPending=true; return; }
+  info.incomingVideo=null;
+  videoTransfers.delete(vid);
+  failedTransfers.delete(vid);
   const blob=new Blob(inc.chunks,{type:inc.mime||'video/mp4'});
   videoUrls.set(vid, URL.createObjectURL(blob));
   if(cId===currentId){
@@ -1602,18 +2085,22 @@ function addVideoMessage(contactId, dir, meta){
 function renderVideoInto(el, v){
   const url=videoUrls.get(v.vid);
   const st=videoTransfers.get(v.vid);
-  const transferring=!!st;
+  const failed=failedTransfers.has(v.vid);
+  const transferring=!!st && !failed;
   let body='';
   if(url){
     body=`<video controls preload="metadata" src="${url}" title="${escapeHtml(v.name)}"></video>`;
   }else if(transferring){
     const pct = st && st.size ? Math.min(100, Math.round(st.received/st.size*100)) : 0;
     body=`<div class="img-expired"><div style="text-align:center"><span class="spinner" style="margin-right:6px"></span>${pct}%</div></div>`;
+  }else if(failed){
+    body=`<div class="img-expired">（视频传输失败 · ${fmtSize(v.size)}）</div>`;
   }else{
     body=`<div class="img-expired">（视频已失效 · ${fmtSize(v.size)}）</div>`;
   }
-  const readTag = v.dir==='out' && v.ts ? `<span class="read-tag" data-ts="${v.ts}"></span>` : '';
-  el.innerHTML=body+`<div class="img-info">${fmtTime(v.ts||nowTs())}${readTag}</div>`;
+  const readTag = v.dir==='out' && v.ts ? `<span class="read-tag" data-ts="${escapeHtml(v.ts)}"></span>` : '';
+  const state = failed ? ` · ${v.dir==='out'?'发送失败':'接收失败'}` : '';
+  el.innerHTML=body+`<div class="img-info">${fmtTime(v.ts||nowTs())}${state}${readTag}</div>`;
 }
 function updateVideoProgress(vid){
   const st=videoTransfers.get(vid); if(!st) return;
@@ -1648,18 +2135,21 @@ async function sendAudio(blob){
   const channel=conn.file;
   if(!channel.bufferedAmountLowThreshold || channel.bufferedAmountLowThreshold<1*1024*1024) channel.bufferedAmountLowThreshold=1*1024*1024;
   const aid=randId();
-  const mime = blob.type || 'audio/webm';
+  const mime = safeMetaName(blob.type,'audio/webm');
   const meta={type:"audio-meta", aid, name:"voice", size:blob.size, mime};
   /* meta/分块/end 全走同一 file 通道（同 image/video），串行锁防并发分块交错 */
   const release = await acquireFileLock();
+  let ok=false;
   try{
     try{ channel.send(JSON.stringify(meta)); }catch(e){ return toast("发送失败: "+e.message); }
     audioTransfers.set(aid,{received:0,size:blob.size,dir:'out',contactId:cId,name:"voice"});
     audioUrls.set(aid, URL.createObjectURL(blob)); // 发送方立即显示播放器
+    failedTransfers.delete(aid);
     addAudioMessage(cId,'out',meta);
     let offset=0;
     while(offset<blob.size && channel.readyState==='open'){
       const buf=await blob.slice(offset, offset+FILE_CHUNK).arrayBuffer();
+      if(!buf || !buf.byteLength) break;
       if(channel.bufferedAmount > FILE_BUF_HIGH){
         try{ await backpressureWait(channel, 30000); }catch(e){ toast("传输中断：网络拥塞超时"); break; }
       }
@@ -1668,19 +2158,39 @@ async function sendAudio(blob){
       offset+=buf.byteLength;
       const st=audioTransfers.get(aid); if(st){ st.received=offset; updateAudioProgress(aid); }
     }
-    if(offset>=blob.size){ try{ channel.send(JSON.stringify({type:"audio-end", aid})); }catch(e){} }
+    if(offset>=blob.size){
+      try{ channel.send(JSON.stringify({type:"audio-end", aid})); ok=true; }catch(e){}
+    }
   }catch(e){ toast("语音发送失败: "+e.message); }
-  finally{ audioTransfers.delete(aid); release(); }
+  finally{
+    audioTransfers.delete(aid);
+    if(!ok){ failedTransfers.add(aid); sendMediaAbort(channel,'audio',aid); }
+    else failedTransfers.delete(aid);
+    release();
+  }
+  if(cId===currentId) renderMessages();
 }
 function startReceiveAudio(cId, info, m){
-  info.incomingAudio={aid:m.aid, name:m.name, size:m.size, mime:m.mime, received:0, chunks:[]};
-  audioTransfers.set(m.aid,{received:0,size:m.size,dir:'in',contactId:cId,name:m.name});
-  addAudioMessage(cId,'in',m);
+  if(!info) return;
+  if(!isSafeTransferId(m.aid) || !isMetaSize(m.size)){ earlyChunksByPc.delete(info.pc); return; }
+  abortAllIncoming(cId, info);
+  const name=safeMetaName(m.name,'voice');
+  const mime=safeMetaName(m.mime,'audio/webm');
+  const inc={aid:m.aid, name, size:m.size, mime, received:0, chunks:[], endPending:false};
+  info.incomingAudio=inc;
+  audioTransfers.set(m.aid,{received:0,size:m.size,dir:'in',contactId:cId,name});
+  failedTransfers.delete(m.aid);
+  addAudioMessage(cId,'in',{aid:m.aid,name,size:m.size});
+  applyEarlyChunks(info, inc, transferDef('audio'));
+  if(inc.received>=inc.size) finishReceiveAudio(cId, info, m.aid);
 }
 function finishReceiveAudio(cId, info, aid){
-  const inc=info.incomingAudio; info.incomingAudio=null;
-  audioTransfers.delete(aid);
+  const inc=info && info.incomingAudio;
   if(!inc || inc.aid!==aid) return;
+  if(inc.received < inc.size){ inc.endPending=true; return; }
+  info.incomingAudio=null;
+  audioTransfers.delete(aid);
+  failedTransfers.delete(aid);
   const blob=new Blob(inc.chunks,{type:inc.mime||'audio/webm'});
   audioUrls.set(aid, URL.createObjectURL(blob));
   if(cId===currentId){
@@ -1701,22 +2211,25 @@ function addAudioMessage(contactId, dir, meta){
 function renderAudioInto(el, a){
   const url=audioUrls.get(a.aid);
   const st=audioTransfers.get(a.aid);
-  const transferring=!!st;
+  const failed=failedTransfers.has(a.aid);
+  const transferring=!!st && !failed;
+  const safeAid = isSafeTransferId(a.aid) ? a.aid : '';
   let body='';
-  if(url){
-    body=`<div class="aud-msg" data-aid="${a.aid}">
-      <button class="aud-play" onclick="toggleAudioPlay('${a.aid}')" title="播放/暂停">▶</button>
-      <div class="aud-track" onclick="seekAudio('${a.aid}', event)" title="点击定位"><div class="aud-fill" id="audfill-${a.aid}"></div></div>
-      <span class="aud-dur" id="auddur-${a.aid}">0:00</span>
+  if(url && safeAid){
+    body=`<div class="aud-msg" data-aid="${safeAid}">
+      <button class="aud-play" onclick="toggleAudioPlay('${safeAid}')" title="播放/暂停">▶</button>
+      <div class="aud-track" onclick="seekAudio('${safeAid}', event)" title="点击定位"><div class="aud-fill" id="audfill-${safeAid}"></div></div>
+      <span class="aud-dur" id="auddur-${safeAid}">0:00</span>
     </div>`;
-  }else if(transferring){
+  }else if(transferring && safeAid){
     const pct = st && st.size ? Math.min(100, Math.round(st.received/st.size*100)) : 0;
-    // v2.13.5：与图片/视频同构（.img-expired>div），updateAudioProgress 才能按同一选择器更新进度
     body=`<div class="img-expired"><div style="text-align:center"><span class="spinner" style="margin-right:6px"></span>接收中 ${pct}%</div></div>`;
+  }else if(failed){
+    body=`<div class="aud-msg aud-expired">${a.dir==='out'?'语音发送失败':'语音接收失败'}</div>`;
   }else{
     body=`<div class="aud-msg aud-expired">语音已失效</div>`;
   }
-  const readTag = a.dir==='out' && a.ts ? `<span class="read-tag" data-ts="${a.ts}"></span>` : '';
+  const readTag = a.dir==='out' && a.ts ? `<span class="read-tag" data-ts="${escapeHtml(a.ts)}"></span>` : '';
   el.innerHTML=body+`<div class="img-info">${fmtTime(a.ts||nowTs())}${readTag}</div>`;
 }
 /* 自定义语音播放器（替代原生 <audio controls>，样式统一、可点击进度条定位） */
@@ -1854,6 +2367,23 @@ function cancelRecordedAudio(){
   closeDialog('dlgAudioConfirm');
   recBlob=null;
 }
+/* 退出账号/导入时中止正在进行的录音，避免 onstop 在数据清空后弹出确认框 */
+function cancelActiveRecording(){
+  recPressing=false; recPending=false;
+  if(recTimer){ clearInterval(recTimer); recTimer=null; }
+  const ind=document.getElementById('recIndicator'); if(ind) ind.style.display='none';
+  if(mediaRecorder){
+    try{
+      mediaRecorder.ondataavailable=null; mediaRecorder.onerror=null; mediaRecorder.onstop=null;
+      if(mediaRecorder.state!=='inactive') mediaRecorder.stop();
+    }catch(e){}
+    mediaRecorder=null;
+  }
+  recChunks=[]; recBlob=null; recStartTs=0;
+  const p=document.getElementById('recPreview');
+  if(p){ if(p.src) URL.revokeObjectURL(p.src); p.src=''; }
+  try{ closeDialog('dlgAudioConfirm'); }catch(e){}
+}
 async function sendRecordedAudio(){
   if(!recBlob) return;
   const blob=recBlob; recBlob=null;
@@ -1892,7 +2422,7 @@ function renderContacts(){
     const div=document.createElement('div');
     div.className='contact'+(c.id===currentId?' active':'');
     const last = c.lastSeen? fmtTime(c.lastSeen):'';
-    const u = store.unread[c.id]||0;
+    const u = Math.max(0, Math.floor(Number(store.unread[c.id])||0));
     div.innerHTML=`<span class="dot${connections.has(c.id)?' on':''}"></span>
       <div class="c-main"><div class="c-name">${contactDisplayHtml(c)}</div>
       <div class="c-ip">${c.ip?escapeHtml(c.ip):'未知 IP'}</div></div>
@@ -1969,7 +2499,7 @@ function renderMessages(forceScroll){
       if(typeof m.seq==='number') el.dataset.seq = m.seq;
       const statusTag = m.pending
         ? '<span class="read-tag pending">⏳ 未发送</span>'
-        : (m.dir==='out'?`<span class="read-tag" data-ts="${m.ts}" data-seq="${typeof m.seq==='number'?m.seq:''}"></span>`:'');
+        : (m.dir==='out'?`<span class="read-tag" data-ts="${escapeHtml(m.ts)}" data-seq="${typeof m.seq==='number'?m.seq:''}"></span>`:'');
       el.innerHTML=escapeHtml(m.text)+`<div class="t">${fmtTime(m.ts)}${statusTag}</div>`;
     }
     box.appendChild(el);
@@ -2025,12 +2555,13 @@ function renderDetailIpInfo(c){
     const mode=ipModeLabel(c.ipType);
     el.innerHTML = `当前对端地址：<b style="font-family:Consolas,monospace">${escapeHtml(c.ip||'未知')}</b>${mode?` <span class="pill">${mode}</span>`:''}`;
   }else{
-    el.innerHTML = `当前对端地址：<span style="color:var(--mut)">未连接（上次：${escapeHtml(c.ip||'—')}${c.ipType?(' · '+ipModeLabel(c.ipType)):''}）</span>`;
+    const mode=ipModeLabel(c.ipType);
+    el.innerHTML = `当前对端地址：<span style="color:var(--mut)">未连接（上次：${escapeHtml(c.ip||'—')}${mode?(' · '+mode):''}）</span>`;
   }
 }
 function saveDetail(){
   const c=getContact(currentId); if(!c) return;
-  const nm=document.getElementById('dName').value.trim();
+  const nm=normalizeName(document.getElementById('dName').value);
   c.name=nm;
   c.nameSet=!!nm; // 有备注才标记，空则回退显示对方用户名
   c.ip=document.getElementById('dIp').value.trim();
@@ -2054,18 +2585,23 @@ function deleteContact(){
   const rv = revivable.get(currentId);
   if(rv){ try{ rv.close(); }catch(e){} }
   revivable.delete(currentId); cancelAutoRevive(currentId); autoReviveRetries.delete(currentId); peerBye.delete(currentId);
+  abortIncomingForContact(currentId); // 中止未完成的媒体传输
+  if(conn) earlyChunksByPc.delete(conn.pc);
+  if(rv) earlyChunksByPc.delete(rv);
   stopContactAudioPlayers(currentId); // 释放语音播放器内存
   revokeContactUrls(currentId);       // 释放文件/图片/视频/语音 objectURL 内存
   store.contacts=store.contacts.filter(c=>c.id!==currentId);
   delete store.messages[currentId];
+  delete store.unread[currentId];
   currentId=null; saveStore(); renderAll(); closeDialog('dlgDetail'); toast("已删除");
 }
 function clearHistory(){
   if(!currentId) return;
   if(!confirm("清空与该联系人的聊天记录？")) return;
+  abortIncomingForContact(currentId);
   stopContactAudioPlayers(currentId); // 释放语音播放器内存
   revokeContactUrls(currentId);       // 释放文件/图片/视频/语音 objectURL 内存
-  store.messages[currentId]=[]; saveStore(); renderMessages(); closeDialog('dlgDetail'); toast("已清空");
+  store.messages[currentId]=[]; store.unread[currentId]=0; saveStore(); renderMessages(); closeDialog('dlgDetail'); toast("已清空");
 }
 
 /* 设置 */
@@ -2074,7 +2610,7 @@ function openSettings(){
   document.getElementById('dlgSettings').classList.add('show');
 }
 function saveSettings(){
-  const newName=document.getElementById('setName').value.trim();
+  const newName=normalizeName(document.getElementById('setName').value);
   const changed = !!newName && newName!==store.identity.name;
   if(changed) store.identity.name=newName;
   saveStore(); renderIdentity(); closeDialog('dlgSettings'); toast("已保存");
@@ -2090,7 +2626,9 @@ function boot(){
   renderAll();
   refreshMyIp();
   syncMobileHistory(); // 注入根历史项，拦截列表页返回键
-  if(!localStorage.getItem(STORE_KEY)){ showOnboard(); } // 首次启动无数据 → 引导
+  let hasData=false;
+  try{ hasData=!!localStorage.getItem(STORE_KEY); }catch(e){}
+  if(loadFailed || !hasData){ showOnboard(); } // 首次启动无数据/读取失败 → 引导
 }
 function showOnboard(){ document.getElementById('dlgOnboard').classList.add('show'); }
 function onboardNew(){
@@ -2103,19 +2641,36 @@ function logoutAccount(){
   closeDialog('dlgSettings');
   document.getElementById('dlgLogout').classList.add('show');
 }
-async function doLogout(backup){
-  closeDialog('dlgLogout');
-  if(backup) await exportJSON(); // 退出前导出一份备份（await 确保导出完成再清数据）
-  flushSave(); // v2.13.6：清掉防抖 pending 再删 key，防 100ms 后把 defaultStore 写回 localStorage
-  localStorage.removeItem(STORE_KEY);
-  channelMap.forEach(i=>{try{i.pc.close();}catch(e){}});
+/* 退出账号/导入前彻底断开：包括 revivable 中的 PC、未完成握手、心跳、录音、播放器与 objectURL */
+function closeAllConnections(){
+  cleanupPending();
+  const pcs=new Set();
+  channelMap.forEach(i=>{ if(i.pc) pcs.add(i.pc); });
+  revivable.forEach(pc=>pcs.add(pc));
+  pcs.forEach(pc=>{ try{ pc.close(); }catch(e){} });
   connections.forEach(conn=>{ for(const [seq,p] of conn.pending) clearTimeout(p.timer); conn.pending.clear(); stopHeartbeat(conn); });
+  cancelActiveRecording();
   if(recReleaseTimer){ clearTimeout(recReleaseTimer); recReleaseTimer=null; }
   if(recStream){ try{ recStream.getTracks().forEach(t=>t.stop()); }catch(e){} recStream=null; }
   connections.clear(); channelMap.clear(); revivable.clear(); peerBye.clear();
   autoReviveTimers.forEach(t=>clearTimeout(t)); autoReviveTimers.clear(); autoReviveRetries.clear();
-  stopAllAudioPlayers(); revokeAllUrls(); // 释放所有语音播放器与传输 objectURL 内存
-  currentId=null; clearConnectWatchdog();
+  earlyChunksByPc.clear();
+  pendingMediaMetaByPc.clear();
+  fileTransfers.clear(); imageTransfers.clear(); videoTransfers.clear(); audioTransfers.clear(); failedTransfers.clear();
+  stopAllAudioPlayers(); revokeAllUrls();
+  try{ closeScanner(); }catch(e){} // 释放可能仍在运行的摄像头
+  clearConnectWatchdog();
+  currentId=null;
+}
+async function doLogout(backup){
+  if(backup){
+    const ok = await exportJSON(); // 先导出，成功后才允许清数据
+    if(!ok){ toast("未完成导出，已取消退出"); return; } // 用户取消分享/导出时保留全部数据
+  }
+  closeDialog('dlgLogout');
+  flushSave(); // 清掉防抖 pending 再删 key，防 100ms 后把 defaultStore 写回 localStorage
+  try{ localStorage.removeItem(STORE_KEY); }catch(e){ toast("清除本地数据失败: "+e.message); return; }
+  closeAllConnections();
   store=defaultStore(); // 内存占位，不保存 → 保持 localStorage 为空，下次启动仍引导
   renderAll();
   showOnboard();
@@ -2133,9 +2688,12 @@ async function exportJSON(){
   try{
     if(navigator.canShare && navigator.canShare({files:[file]})){
       await navigator.share({files:[file], title:`P2PChat 备份 - ${store.identity.name}`, text:filename});
-      toast("已导出"); return;
+      toast("已导出"); return true;
     }
-  }catch(e){ if(e && e.name==='AbortError') return; /* 用户取消则结束，否则回退到下载 */ }
+  }catch(e){
+    if(e && e.name==='AbortError'){ toast("已取消导出"); return false; } // 用户取消：退出账号必须中止
+    /* 其他错误回退到下载 */
+  }
   // 回退：a[download]，需挂到 DOM 才能在部分移动浏览器触发
   const url=URL.createObjectURL(blob);
   const a=document.createElement('a');
@@ -2143,6 +2701,7 @@ async function exportJSON(){
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(()=>URL.revokeObjectURL(url), 2000);
   toast("已导出；若未弹出下载，请用系统浏览器打开本页再导出");
+  return true;
 }
 function importJSON(){ document.getElementById('fileInput').click(); }
 document.getElementById('fileInput').addEventListener('change', e=>{
@@ -2152,20 +2711,15 @@ document.getElementById('fileInput').addEventListener('change', e=>{
     r.onload=()=>{
       try{
         const d=JSON.parse(r.result);
-        if(!d.identity || !Array.isArray(d.contacts)) throw new Error("格式不符");
-        if(!confirm("导入将覆盖当前数据，是否继续？")){ onboarding=false; return; }
-        // v2.13.5：导入即切换整套账号数据，旧连接必须全套清理（对齐 doLogout）——
-        // 否则旧 DataChannel 仍开着，来消息会往新 store 按旧 contactId 写孤儿消息；
-        // 残留的 revivable/autoRevive 定时器还会在导入后复活已不存在的联系人。
-        channelMap.forEach(i=>{try{i.pc.close();}catch(e){}});
-        connections.forEach(conn=>{ for(const [seq,p] of conn.pending) clearTimeout(p.timer); conn.pending.clear(); stopHeartbeat(conn); });
-        autoReviveTimers.forEach(t=>clearTimeout(t)); autoReviveTimers.clear(); autoReviveRetries.clear();
-        connections.clear(); channelMap.clear(); revivable.clear(); peerBye.clear();
-        cleanupPending();
-        // v2.13.5：走 migrateStore 做 contact 字段迁移（旧备份补 nameSet/peerName/seq 回执字段），与 loadStore 一致
-        store = migrateStore({...defaultStore(), ...d});
-        saveStore(); currentId=null; renderAll(); toast("导入成功");
-        if(onboarding){ onboarding=false; closeDialog('dlgOnboard'); }
+        if(!d || typeof d!=='object' || !d.identity || !Array.isArray(d.contacts)) throw new Error("格式不符");
+        if(!confirm("导入将覆盖当前数据，是否继续？")) return; // 保留引导态，下次导入成功仍会关闭引导弹窗
+        // 先构建新数据（可能触发迁移错误），再断开旧连接并整体替换，避免导入失败时丢失现有会话
+        const next=migrateStore({...defaultStore(), ...d});
+        flushSave();
+        closeAllConnections();
+        store = next;
+        saveStore(); renderAll(); toast("导入成功");
+        closeDialog('dlgOnboard'); onboarding=false;
       }catch(err){ toast("导入失败: "+err.message); }
     };
     r.onerror=()=>{ toast("文件读取失败"); };
@@ -2177,6 +2731,7 @@ document.getElementById('fileInput').addEventListener('change', e=>{
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function copyText(t){
   if(!t) return;
+  if(t.indexOf('⏳')===0) return toast("内容尚未生成完成");
   if(navigator.clipboard && navigator.clipboard.writeText){
     navigator.clipboard.writeText(t).then(()=>toast("已复制")).catch(()=>fallbackCopy(t));
   } else fallbackCopy(t);
@@ -2184,7 +2739,7 @@ function copyText(t){
 function fallbackCopy(t){
   const ta=document.createElement('textarea'); ta.value=t; ta.style.position='fixed'; ta.style.opacity='0';
   document.body.appendChild(ta); ta.select();
-  try{ document.execCommand('copy'); toast("已复制"); }catch(e){ toast("复制失败，请手动选择复制"); }
+  try{ const ok=document.execCommand('copy'); toast(ok===false?"复制失败，请手动选择复制":"已复制"); }catch(e){ toast("复制失败，请手动选择复制"); }
   document.body.removeChild(ta);
 }
 let toastTimer=null;

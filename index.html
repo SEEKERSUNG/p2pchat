@@ -11,7 +11,7 @@
   <!-- 侧栏 -->
   <aside id="sidebar">
     <div class="side-head">
-      <h1>🌍 P2PChat<a class="gh-link" href="https://github.com/SEEKERSUNG/P2PChat" target="_blank" rel="noopener" title="GitHub 源码仓库">GitHub ↗</a><span class="ver">v2.13.7</span></h1>
+      <h1>🌍 P2PChat<a class="gh-link" href="https://github.com/SEEKERSUNG/P2PChat" target="_blank" rel="noopener" title="GitHub 源码仓库">GitHub ↗</a><span class="ver">v2.13.8</span></h1>
       <div class="me">我：<b id="myName">—</b> <span class="pill" id="myId">—</span></div>
       <div class="toolbar">
         <button onclick="startInvite()">➕ 新建连接</button>
@@ -45,7 +45,7 @@
     <div class="composer">
       <button class="ghost" id="btnMic" title="按住录音，松手结束" disabled><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg></button>
       <textarea id="inputMsg" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled
-        onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMsg()}"></textarea>
+        onkeydown="if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing&&event.keyCode!==229){event.preventDefault();sendMsg()}"></textarea>
       <button class="ghost" id="btnAttach" onclick="toggleAttachMenu(event)" title="发送附件" disabled><svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M10 4v12M4 10h12"/></svg></button>
       <button onclick="sendMsg()">发送</button>
       <div class="attach-pop" id="attachPop">
@@ -76,7 +76,7 @@
   <div class="modal">
     <h2>联系人详情</h2>
     <div class="desc">修改备注与 IP（IP 为识别用，自动重连需重新交换连接码）。</div>
-    <div class="field"><label>备注名</label><input id="dName" placeholder="留空则显示对方用户名"></div>
+    <div class="field"><label>备注名</label><input id="dName" maxlength="32" placeholder="留空则显示对方用户名"></div>
     <div class="row"><label>对方用户名</label><span class="pill" id="dPeer">—</span></div>
     <div class="field"><label>IPv6 / IPv4 地址</label><input id="dIp" placeholder="如 2001:db8::1 或 192.168.1.5"></div>
     <div class="hint" id="dIpInfo" style="margin:-4px 0 8px">当前对端地址：—</div>
@@ -95,7 +95,7 @@
 <div class="overlay" id="dlgSettings">
   <div class="modal">
     <h2>设置</h2>
-    <div class="field"><label>我的显示名</label><input id="setName"></div>
+    <div class="field"><label>我的显示名</label><input id="setName" maxlength="32"></div>
     <div class="hint">已启用 <b>STUN 辅助</b>（始终开启）：使用国内公共 STUN（小米 / 腾讯 / B站）获取 IPv4 反射地址，并补充 Cloudflare STUN（支持 IPv6，国内可达）与 Google STUN（候补）获取 IPv6 反射地址，绕过 Chrome mDNS 混淆。仅在建连阶段联系 STUN，消息仍端到端加密、不经过 STUN。本机真实 IP 被 mDNS 隐藏时，侧栏将显示 STUN 反射的公网地址并标注。</div>
     <div class="hint">Google STUN 用于 IPv6 反射候补，国内可能不可达；不可达时退回 IPv4 或 Cloudflare IPv6，不影响连接。需系统防火墙放行入站 UDP；STUN 仅能获取反射地址，仍需双方在同一局域网或均具公网 IP（不能穿越对称型 NAT）。</div>
     <div class="hint">提示：因 WebRTC 会话信息每次临时生成，已保存联系人无法凭 IP 自动重连，每次重连仍需重新交换一次连接码。</div>
@@ -249,6 +249,6 @@
 <div class="toast" id="toast"></div>
 <script src="lib/qrcode-generator.js"></script>
 <script src="lib/jsQR.min.js"></script>
-<script src="js/app.js?v=2.13.7"></script>
+<script src="js/app.js?v=2.13.8"></script>
 </body>
 </html>
